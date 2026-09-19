@@ -1,80 +1,99 @@
-import base64
-import json
+"""Entry point for the Raspberry Pi node.
+
+Streams webcam frames to the phone app over TCP using the JSON-lines protocol
+the Android client already speaks, and plays back speech audio it sends.
+
+Protocol (unchanged):
+  Pi   -> phone: {"type": "video_frame", "image": <base64 jpeg>, "timestamp": <float>}
+  phone -> Pi  : {"type": "speech_output", "text": str, "audio_data": <base64 pcm>, "sample_rate": int}
+Both directions are newline delimited JSON.
+"""
+
 import socket
-import threading
-import time
-import cv2
-import numpy as np
-import sounddevice as sd
 
-HOST = "192.168.0.206"
-PORT = 8765
+from audio_output import is_playback_available, playback_unavailable_reason
+from client_session import ClientSession
+from config import HOST, LISTEN_BACKLOG, PORT
 
-def handle_incoming_speech(conn):
-    """Receives text/audio payloads from Android and plays via 3.5mm jack."""
+BANNER_WIDTH = 52
+
+
+def discover_local_addresses() -> list[str]:
+    """Best-effort list of addresses the phone can reach this Pi on."""
+    addresses: list[str] = []
+
     try:
-        reader = conn.makefile('r')
-        while True:
-            line = reader.readline()
-            if not line:
-                print("[Pi] Client disconnected.")
-                break
+        _, _, host_ips = socket.gethostbyname_ex(socket.gethostname())
+        addresses.extend(host_ips)
+    except OSError:
+        pass
 
-            data = json.loads(line)
-            if data.get("type") == "speech_output":
-                text = data.get("text", "")
-                audio_b64 = data.get("audio_data", "")
-                sample_rate = data.get("sample_rate", 16000)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            addresses.append(probe.getsockname()[0])
+    except OSError:
+        pass
 
-                print(f"[Pi Speaker Output]: {text}")
+    return sorted({ip for ip in addresses if not ip.startswith("127.")})
 
-                if audio_b64:
-                    pcm_bytes = base64.b64decode(audio_b64)
-                    audio_np = np.frombuffer(pcm_bytes, dtype=np.int16)
-                    sd.play(audio_np, samplerate=sample_rate)
-                    sd.wait()
-    except Exception as e:
-        print(f"[Pi Receiver Error]: {e}")
 
-def start_pi_server():
+def print_startup_banner() -> None:
+    print("=" * BANNER_WIDTH)
+    print("[Pi Node] Camera + speech server starting")
+    print(f"[Pi Node] Listening on {HOST}:{PORT}")
+    for address in discover_local_addresses():
+        print(f"[Pi Node]   -> point the app at {address}:{PORT}")
+    if is_playback_available():
+        print("[Pi Audio] Speaker playback ready.")
+    else:
+        print(f"[Pi Audio] Speaker playback off: {playback_unavailable_reason()}")
+        print("[Pi Audio] Fix with: sudo apt install libportaudio2")
+    print("=" * BANNER_WIDTH)
+
+
+def create_server() -> socket.socket:
+    """Create the listening socket, accepting connections on every interface."""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
-    server.listen(1)
-    print(f"[Pi Node Active] Listening on port {PORT}...")
+    server.listen(LISTEN_BACKLOG)
+    return server
 
+
+def serve_forever(server: socket.socket) -> None:
+    """Accept phones one at a time, serving each until it disconnects."""
     while True:
-        conn, addr = server.accept()
-        print(f"[Pi Node] Connected to Android Phone at {addr}")
+        connection, address = server.accept()
+        print(f"[Pi Node] Phone connected from {address[0]}:{address[1]}")
 
-        speech_thread = threading.Thread(target=handle_incoming_speech, args=(conn,), daemon=True)
-        speech_thread.start()
-
-        cap = cv2.VideoCapture(0)
-
+        session = ClientSession(connection, address)
         try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                frame = cv2.resize(frame, (320, 240))
-                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
-                img_b64 = base64.b64encode(buffer).decode('utf-8')
-
-                payload = json.dumps({
-                    "type": "video_frame",
-                    "image": img_b64,
-                    "timestamp": time.time()
-                }) + "\n"
-
-                conn.sendall(payload.encode('utf-8'))
-                time.sleep(0.1)  # 10 FPS
-        except (BrokenPipeError, ConnectionResetError):
-            print("[Pi] Connection lost. Waiting for reconnect...")
+            session.run()
+        except Exception as exc:  # keep the listener alive for the next phone
+            print(f"[Pi Node] Session error: {exc}")
         finally:
-            cap.release()
-            conn.close()
+            session.close()
 
-if __name__ == '__main__':
-    start_pi_server()
+        print("[Pi Node] Phone disconnected. Waiting for reconnect...")
+
+
+def main() -> None:
+    print_startup_banner()
+
+    try:
+        server = create_server()
+    except OSError as exc:
+        print(f"[Pi Node] FATAL: cannot listen on {HOST}:{PORT} -> {exc}")
+        raise SystemExit(1) from exc
+
+    try:
+        serve_forever(server)
+    except KeyboardInterrupt:
+        print("\n[Pi Node] Shutting down.")
+    finally:
+        server.close()
+
+
+if __name__ == "__main__":
+    main()
