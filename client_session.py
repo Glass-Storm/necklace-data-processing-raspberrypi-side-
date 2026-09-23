@@ -6,11 +6,12 @@ import threading
 import time
 
 from audio_output import play_speech_audio
-from config import DEFAULT_SAMPLE_RATE, FRAME_INTERVAL_SECONDS
+from config import DEFAULT_SAMPLE_RATE, DEVICE_ID, FRAME_INTERVAL_SECONDS, PORT
 from video_stream import VideoStream
 
 SPEECH_MESSAGE_TYPE = "speech_output"
 VIDEO_MESSAGE_TYPE = "video_frame"
+HELLO_MESSAGE_TYPE = "hello"
 
 
 class ClientSession:
@@ -29,6 +30,12 @@ class ClientSession:
     def run(self) -> None:
         """Stream frames until the phone disconnects or the camera dies."""
         self._start_speech_listener()
+
+        # Identify ourselves before opening the camera. A discovery probe reads
+        # this greeting to confirm the host is a necklace node, then disconnects
+        # without ever starting a video session.
+        if not self._send_hello():
+            return
 
         video = VideoStream()
         try:
@@ -51,6 +58,26 @@ class ClientSession:
             self._connection.close()
         except OSError:
             pass
+
+    def _send_hello(self) -> bool:
+        """Announce this node to the client. Returns False if it already left."""
+        payload = json.dumps(
+            {
+                "type": HELLO_MESSAGE_TYPE,
+                "device": "necklace-pi",
+                "device_id": DEVICE_ID,
+                "protocol": 1,
+                "port": PORT,
+            }
+        ) + "\n"
+        try:
+            self._connection.sendall(payload.encode("utf-8"))
+        except OSError as exc:
+            # The probe disconnected immediately after reading — expected.
+            print(f"[Pi Node] Client left during handshake ({exc}).")
+            return False
+        return True
+
 
     def _stream_frames(self, video: VideoStream) -> None:
         while not self._stop_event.is_set():

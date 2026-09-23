@@ -26,3 +26,8 @@ DEFAULT_SAMPLE_RATE = int(os.environ.get("PI_NODE_SAMPLE_RATE", "16000"))
 
 # Number of queued phone connections accepted by the listening socket.
 LISTEN_BACKLOG = 1
+
+# Identifier sent in the hello handshake so the app can confirm it found the
+# right node, and distinguish between multiple Pis on the same network.
+DEVICE_ID = os.environ.get("PI_NODE_DEVICE_ID", "necklace-01")
+
