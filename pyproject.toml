@@ -25,4 +25,6 @@ pi = ["picamera2"]
 dev = ["pytest"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ecosys_pi"]
+# `ecosys_pi` is the hand-written client; `ecosys` is the generated
+# protobuf/gRPC stub package (see scripts/gen_proto.sh). Both live under src/.
+packages = ["src/ecosys_pi", "src/ecosys"]

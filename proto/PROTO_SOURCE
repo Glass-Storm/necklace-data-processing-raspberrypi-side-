@@ -1,0 +1,16 @@
+# Provenance of the vendored frozen contract: proto/ecosys/v1/ecosys.proto
+#
+# The contract is FROZEN. This file records where the vendored copy came from
+# and its exact content hash. Any regeneration of the gRPC stubs MUST start from
+# this byte-identical file; any change to the contract MUST come from the hub
+# and be re-vendored here (never hand-edited on the Pi).
+#
+# Key=value lines (not INI) so both humans and shell/CI can parse them.
+source_repo=phone-manager
+source_path=contract/src/main/proto/ecosys/v1/ecosys.proto
+source_commit=0d454ce
+proto_sha256=a09d830989898908cd4073c52658acff7aa0302f10f254576618bf27662d7c3b
+# The contract proto is unchanged between 0d454ce and 5594226 (hub HEAD at the
+# time this file was written); verified by `git show <rev>:<path> | sha256sum`.
+# The drift test (tests/test_proto_drift.py) re-derives the hash straight from
+# the sibling hub checkout and compares it to the vendored copy.

@@ -1,0 +1,111 @@
+// ecosys.v1 — the FROZEN wire contract of the phone-manager device ecosystem.
+//
+// This single file is the contract spoken by three peers:
+//   * the phone hub (this repo, Kotlin/JVM + Kotlin/Android, protobuf-lite)
+//   * the smart-glasses app   (OUT OF SCOPE here — generated from this file)
+//   * the Ubuntu daemon       (OUT OF SCOPE here — generated from this file)
+//
+// Rules for changing this file (the contract is frozen):
+//   * never renumber or reuse a field number or enum value
+//   * never change an existing field's type or name
+//   * additive changes (new fields/messages/rpcs) are allowed and must be optional
+//
+// NOTE: `option java_multiple_files = true` splits generated types into
+// one Java file per message. Kotlin lite codegen is configured separately in
+// service/build.gradle.kts (protobuf-gradle-plugin `option("lite")`).
+syntax = "proto3";
+
+package ecosys.v1;
+
+option java_multiple_files = true;
+
+// Go codegen target. protoc-gen-go REFUSES to generate without a go_package
+// (it cannot infer the import path), so this option is mandatory for the
+// `tools/mockpeer` codegen — it is the Go counterpart of java_multiple_files.
+// Kotlin/JVM codegen ignores it. Go peers may override with an `M` mapping.
+option go_package = "phone-manager/tools/mockpeer/gen/ecosys/v1;ecosysv1";
+
+// Which side of the ecosystem a paired peer is. Unspecified is the zero value
+// so a default-constructed PairRequest never claims a role.
+enum DeviceRole {
+  DEVICE_ROLE_UNSPECIFIED = 0;
+  DEVICE_ROLE_GLASS = 1;
+  DEVICE_ROLE_DAEMON = 2;
+}
+
+// The kind of media carried by a stream. Unspecified is the zero value.
+enum StreamKind {
+  STREAM_KIND_UNSPECIFIED = 0;
+  STREAM_KIND_AUDIO = 1;
+  STREAM_KIND_VIDEO = 2;
+}
+
+// PairingService/Pair only. `pin` is the single-use 6-digit code shown by the
+// hub inside an open pairing window. It is never sent on any other RPC.
+message PairRequest {
+  string pin = 1;
+  string device_name = 2;
+  DeviceRole role = 3;
+}
+
+// PairingService/Pair reply. On rejection `ok` is false and `reject_reason`
+// carries a machine-checkable reason; `token`/`device_id` stay empty.
+message PairResponse {
+  bool ok = 1;
+  string token = 2;
+  string device_id = 3;
+  string reject_reason = 4;
+}
+
+// PairingService/Heartbeat request. `device_id` identifies the paired peer.
+message HeartbeatRequest {
+  string device_id = 1;
+}
+
+// PairingService/Heartbeat reply. `server_time_ms` is the hub clock in
+// milliseconds since the Unix epoch, used by peers to detect skew.
+message HeartbeatResponse {
+  bool ok = 1;
+  int64 server_time_ms = 2;
+}
+
+// StreamService/OpenStream bootstrap frame. Sent by the peer as the first
+// message on the bidi stream so the hub can bind the session to a device.
+// NOTE: this message is part of the frozen contract even though StreamFrame
+// does not (yet) carry it; peers may exchange it over their own side channel.
+message StreamOpenRequest {
+  string device_id = 1;
+  StreamKind kind = 2;
+}
+
+// One recognized utterance returned to the peer.
+message StreamResult {
+  string text = 1;
+  string speaker_label = 2;
+  int64 pts_ms = 3;
+}
+
+// A single frame on the bidirectional stream. Exactly one payload variant is
+// set at a time (oneof). Media payloads are OPAQUE to the hub: audio is raw
+// little-endian PCM16 mono @ 16 kHz, video is raw H.264 NAL units that the
+// phone NEVER decodes or re-encodes.
+message StreamFrame {
+  oneof payload {
+    bytes audio_pcm16_16k = 1;
+    bytes video_h264_nal = 2;
+    string transcript = 3;
+    StreamResult result = 4;
+  }
+}
+
+// Pairing + liveness. Pair is the ONE rpc allowed without a bearer token
+// (and only while a pairing window is open). Heartbeat requires a token.
+service PairingService {
+  rpc Pair(PairRequest) returns (PairResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// Bidirectional media + results relay. Every rpc here requires a token.
+service StreamService {
+  rpc OpenStream(stream StreamFrame) returns (stream StreamFrame);
+}
