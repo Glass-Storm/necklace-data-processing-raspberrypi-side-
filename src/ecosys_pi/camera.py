@@ -161,8 +161,16 @@ class VideoSource(Protocol):
     Implementations must follow the legacy camera posture: ``open()`` reports
     availability by returning ``False`` instead of raising, and ``close()`` is
     idempotent. ``read_nal()`` returns one start-code-prefixed NAL, or ``None``
-    when no frame is ready yet (or the source is exhausted).
+    when no frame is ready yet (or the source is done). Because ``None`` is also
+    the normal "no NAL queued yet" state for a live camera, callers MUST consult
+    :attr:`done` to tell "not ready yet" apart from "exhausted": a live camera is
+    never done, a bounded synthetic source is done once its cap is reached.
     """
+
+    @property
+    def done(self) -> bool:
+        """True once no further NAL can ever be produced."""
+        ...
 
     def open(self) -> bool:
         """Acquire the hardware/source. Returns ``False`` when unavailable."""
@@ -209,6 +217,11 @@ class SyntheticVideoSource:
         self._frame_count = frame_count
         self._index = 0
         self._open = False
+
+    @property
+    def done(self) -> bool:
+        """True once ``frame_count`` NALs have been produced; never when infinite."""
+        return self._frame_count is not None and self._index >= self._frame_count
 
     def open(self) -> bool:
         """Always succeeds; there is no hardware to fail."""
@@ -310,6 +323,11 @@ class Picamera2VideoSource:
         self._pending: deque[bytes] = deque()
         self._lock = threading.Lock()
 
+    @property
+    def done(self) -> bool:
+        """Always ``False``: a live camera never exhausts its stream."""
+        return False
+
     def open(self) -> bool:
         """Start the camera + encoder. ``False`` when unavailable (never raises)."""
         try:
@@ -321,24 +339,33 @@ class Picamera2VideoSource:
 
         try:
             picam2 = Picamera2()
-            config = picam2.create_video_configuration(
-                main={"size": (self._width, self._height)}
-            )
-            picam2.configure(config)
-            encoder = H264Encoder(bitrate=self._bitrate, framerate=self._framerate)
-            output = _make_annex_b_output(self._pending, self._lock)
-            picam2.start_recording(encoder, output)
+            # Assign IMMEDIATELY: if configure/start fails below, the except path
+            # calls close(), which must see ``self._picam2`` to release the V4L2/ISP
+            # handles. Leaving it unassigned would leak the camera on the Pi.
+            self._picam2 = picam2
+            self._start_pipeline(picam2, H264Encoder)
         except Exception as exc:  # noqa: BLE001 - hardware failure => keep running
             print(f"[Pi Camera] could not start capture: {exc}")
             self.close()
             return False
 
-        self._picam2 = picam2
-        self._encoder = encoder
         print(
             f"[Pi Camera] opened {self._width}x{self._height} @ {self._bitrate} bit/s"
         )
         return True
+
+    def _start_pipeline(self, picam2: object, encoder_cls: object) -> None:
+        """Configure and start the recording pipeline (injectable for tests)."""
+        config = picam2.create_video_configuration(  # type: ignore[attr-defined]
+            main={"size": (self._width, self._height)}
+        )
+        picam2.configure(config)  # type: ignore[attr-defined]
+        encoder = encoder_cls(  # type: ignore[operator]
+            bitrate=self._bitrate, framerate=self._framerate
+        )
+        output = _make_annex_b_output(self._pending, self._lock)
+        picam2.start_recording(encoder, output)  # type: ignore[attr-defined]
+        self._encoder = encoder
 
     def read_nal(self) -> bytes | None:
         """Drain one queued NAL, or ``None`` when none has arrived yet."""

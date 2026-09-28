@@ -242,10 +242,6 @@ class HalfDuplexGate:
     def speaking(self, value: bool) -> None:
         self._speaking = bool(value)
 
-    def set_speaking(self, value: bool) -> None:
-        """Explicit setter, equivalent to assigning :attr:`speaking`."""
-        self._speaking = bool(value)
-
     def __repr__(self) -> str:
         return f"HalfDuplexGate(speaking={self._speaking})"
 

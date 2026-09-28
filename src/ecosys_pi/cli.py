@@ -395,8 +395,12 @@ async def _run_video(
     """Pump H.264 NALs from ``source`` into the stream until the cap is reached.
 
     ``max_frames is None`` runs until the source is exhausted or the process is
-    interrupted. A real camera paces itself; this loop paces the (synthetic)
-    source at the nominal 30 fps so it never floods the bounded queue.
+    interrupted. ``read_nal()`` returns ``None`` both when a live camera has no
+    NAL queued yet and when a bounded source is exhausted, so this loop consults
+    ``source.done`` to tell those apart: a live camera is never done and the pump
+    simply keeps polling, while a bounded source stops. A real camera paces
+    itself; this loop also paces the (synthetic) source at the nominal 30 fps so
+    it never floods the bounded queue.
     """
     from ecosys.v1 import ecosys_pb2
 
@@ -411,7 +415,7 @@ async def _run_video(
         while max_frames is None or sent < max_frames:
             nal = source.read_nal()
             if nal is None:
-                if max_frames is None:
+                if source.done:
                     break
                 await asyncio.sleep(interval)
                 continue

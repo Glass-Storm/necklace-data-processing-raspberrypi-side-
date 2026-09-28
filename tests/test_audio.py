@@ -162,7 +162,7 @@ def test_gate_defaults_to_not_speaking() -> None:
     assert gate.speaking is False
     gate.speaking = True
     assert gate.speaking is True
-    gate.set_speaking(False)
+    gate.speaking = False
     assert gate.speaking is False
 
 

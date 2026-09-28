@@ -137,6 +137,38 @@ def test_synthetic_source_satisfies_video_source_protocol() -> None:
     assert isinstance(camera.SyntheticVideoSource(), camera.VideoSource)
 
 
+def test_synthetic_source_done_false_while_frames_remain() -> None:
+    source = camera.SyntheticVideoSource(frame_count=2)
+    source.open()
+    assert source.done is False
+    source.read_nal()
+    assert source.done is False
+    source.read_nal()
+    assert source.done is True
+
+
+def test_synthetic_source_unbounded_is_never_done() -> None:
+    source = camera.SyntheticVideoSource()
+    source.open()
+    for _ in range(10):
+        assert source.read_nal() is not None
+        assert source.done is False
+
+
+def test_synthetic_source_with_cap_is_done_before_open_and_after_close() -> None:
+    source = camera.SyntheticVideoSource(frame_count=1)
+    assert source.done is False  # cap not reached yet, even though closed
+    source.open()
+    source.read_nal()
+    assert source.done is True
+    source.close()
+    assert source.done is True
+
+
+def test_picamera2_source_is_never_done() -> None:
+    assert camera.Picamera2VideoSource().done is False
+
+
 def test_new_source_starts_closed_and_reopens() -> None:
     source = camera.SyntheticVideoSource(frame_count=1)
     assert source.read_nal() is None
@@ -197,3 +229,78 @@ def test_picamera2_source_close_is_idempotent_without_open() -> None:
     source = camera.Picamera2VideoSource()
     source.close()
     source.close()
+
+
+class _FakePicamera2:
+    """Stands in for ``picamera2.Picamera2``; records teardown calls."""
+
+    instances: list["_FakePicamera2"] = []
+
+    def __init__(self) -> None:
+        self.closed = 0
+        self.stop_recording_calls = 0
+        _FakePicamera2.instances.append(self)
+
+    def close(self) -> None:
+        self.closed += 1
+
+    def stop_recording(self) -> None:
+        self.stop_recording_calls += 1
+
+
+def _install_fake_picamera2(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``from picamera2 import Picamera2`` resolve without hardware."""
+    import types
+
+    _FakePicamera2.instances = []
+    picamera2 = types.ModuleType("picamera2")
+    picamera2.Picamera2 = _FakePicamera2
+    encoders = types.ModuleType("picamera2.encoders")
+    encoders.H264Encoder = object
+    picamera2.encoders = encoders
+    monkeypatch.setitem(sys.modules, "picamera2", picamera2)
+    monkeypatch.setitem(sys.modules, "picamera2.encoders", encoders)
+
+
+def test_picamera2_start_failure_closes_the_constructed_camera(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pipeline-start failure must tear down the already-constructed camera.
+
+    Reproduces bug M1 WITHOUT hardware: ``Picamera2()`` succeeds, then the
+    pipeline start raises, so ``open()`` must return ``False`` AND close the
+    camera it created (previously the handle leaked because ``_picam2`` was
+    assigned only after success).
+    """
+    _install_fake_picamera2(monkeypatch)
+    source = camera.Picamera2VideoSource()
+
+    def _boom(_picam2: object, _encoder_cls: object) -> None:
+        raise RuntimeError("simulated ISP failure")
+
+    monkeypatch.setattr(source, "_start_pipeline", _boom)
+
+    assert source.open() is False
+    assert len(_FakePicamera2.instances) == 1, "Picamera2 must have been constructed"
+    assert _FakePicamera2.instances[0].closed == 1, "camera handle leaked on failure"
+    assert source.read_nal() is None
+
+
+def test_picamera2_success_path_keeps_the_camera_open_and_starts_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The success path is unchanged: open() True and close() tears down once."""
+    _install_fake_picamera2(monkeypatch)
+    source = camera.Picamera2VideoSource()
+    started: list[object] = []
+    monkeypatch.setattr(
+        source, "_start_pipeline", lambda picam2, _cls: started.append(picam2)
+    )
+
+    assert source.open() is True
+    assert started == _FakePicamera2.instances
+    assert _FakePicamera2.instances[0].closed == 0
+
+    source.close()
+    assert _FakePicamera2.instances[0].stop_recording_calls == 1
+    assert _FakePicamera2.instances[0].closed == 1

@@ -18,6 +18,8 @@ Coverage:
 
 from __future__ import annotations
 
+import asyncio
+import io
 import os
 import re
 import subprocess
@@ -28,6 +30,7 @@ import grpc
 import pytest
 
 from ecosys.v1 import ecosys_pb2, ecosys_pb2_grpc
+from ecosys_pi import camera, cli
 from ecosys_pi.token_store import Credentials, TokenStore
 
 TOKEN = "issued-token-cli"
@@ -283,6 +286,108 @@ def test_cache_seeded_token_is_reused(tmp_path) -> None:
     assert result.returncode == 0, result.stderr
     assert hub.pair_call_count == 0
     assert "pair-ok" not in result.stdout
+
+
+# --- Video pump: None is "not ready", not "exhausted" (bug M2) ---------------
+
+
+class _RecordingVideoClient:
+    """Captures the ``StreamFrame``s ``_run_video`` sends."""
+
+    def __init__(self) -> None:
+        self.frames: list[object] = []
+
+    async def send(self, frame: object) -> None:
+        self.frames.append(frame)
+
+
+class _GapThenNalsVideoSource:
+    """A camera-like source: ``read_nal`` returns ``None`` for a few polls.
+
+    Mirrors a real ``Picamera2VideoSource``, where ``None`` is the normal "no NAL
+    queued yet" state. Once the gaps pass it yields its NALs, then reports
+    ``done`` so a bounded pump can terminate.
+    """
+
+    def __init__(self, nals: list[bytes], gaps: int = 2) -> None:
+        self._nals = list(nals)
+        self._gaps = gaps
+        self._index = 0
+
+    @property
+    def done(self) -> bool:
+        return self._gaps <= 0 and self._index >= len(self._nals)
+
+    def open(self) -> bool:
+        return True
+
+    def read_nal(self) -> bytes | None:
+        if self._gaps > 0:
+            self._gaps -= 1
+            return None
+        if self._index < len(self._nals):
+            nal = self._nals[self._index]
+            self._index += 1
+            return nal
+        return None
+
+    def close(self) -> None:
+        pass
+
+
+def _run_video_pump(source: object, max_frames: int | None) -> tuple[int, list[object]]:
+    client = _RecordingVideoClient()
+    err = io.StringIO()
+    sent = asyncio.run(
+        cli._run_video(source, client, max_frames, err=err, interval=0.0)
+    )
+    return sent, client.frames
+
+
+def test_video_pump_does_not_stop_on_an_empty_read_when_frames_unbounded() -> None:
+    """Bug M2: an initial ``None`` under ``--frames 0`` must NOT end the pump."""
+    nals = [camera.synthetic_video_nal(0), camera.synthetic_video_nal(1)]
+    source = _GapThenNalsVideoSource(nals, gaps=3)
+
+    sent, frames = _run_video_pump(source, max_frames=None)
+
+    assert sent == 2, "an empty read must not abort an unbounded video pump"
+    assert [frame.video_h264_nal for frame in frames] == nals
+
+
+def test_video_pump_terminates_when_a_bounded_source_is_done() -> None:
+    """A capped synthetic source still terminates an unbounded pump."""
+    source = camera.SyntheticVideoSource(frame_count=3)
+
+    sent, frames = _run_video_pump(source, max_frames=None)
+
+    assert sent == 3
+    assert [frame.video_h264_nal for frame in frames] == [
+        camera.synthetic_video_nal(0),
+        camera.synthetic_video_nal(1),
+        camera.synthetic_video_nal(2),
+    ]
+
+
+def test_video_pump_honours_an_explicit_frame_cap() -> None:
+    source = camera.SyntheticVideoSource()
+    sent, _frames = _run_video_pump(source, max_frames=2)
+    assert sent == 2
+
+
+# --- The frozen stdout contract is referenced, not dead documentation --------
+
+
+def test_stdout_contract_is_the_six_frozen_lines() -> None:
+    """``STDOUT_CONTRACT`` pins exactly the six documented tokens."""
+    assert cli.STDOUT_CONTRACT == (
+        "pair-ok device=<id>",
+        "heartbeat-ok",
+        "transcript <text>",
+        "pair-rejected reason=<r>",
+        "re-pair-requested",
+        "error: <detail>",
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation
