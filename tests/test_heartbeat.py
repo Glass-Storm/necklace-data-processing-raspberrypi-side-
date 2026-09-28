@@ -125,17 +125,26 @@ def test_default_interval_is_30_seconds() -> None:
 
 
 def test_missing_credentials_are_refused_locally() -> None:
-    """An empty token or device_id cannot produce a valid heartbeat."""
-    channel = aio.insecure_channel("127.0.0.1:1")
-    try:
-        with pytest.raises(ValueError):
-            HeartbeatClient(channel, "", DEVICE_ID)
-        with pytest.raises(ValueError):
-            HeartbeatClient(channel, TOKEN, "")
-        with pytest.raises(ValueError):
-            HeartbeatClient(channel, TOKEN, DEVICE_ID, interval=0)
-    finally:
-        asyncio.run(channel.close())
+    """An empty token or device_id cannot produce a valid heartbeat.
+
+    The body runs INSIDE ``asyncio.run`` so the ``aio`` channel is created with
+    a current event loop present: Python 3.12 does not auto-create one, and a
+    preceding suite test's ``asyncio.run`` clears the main-thread loop.
+    """
+
+    async def _run() -> None:
+        channel = aio.insecure_channel("127.0.0.1:1")
+        try:
+            with pytest.raises(ValueError):
+                HeartbeatClient(channel, "", DEVICE_ID)
+            with pytest.raises(ValueError):
+                HeartbeatClient(channel, TOKEN, "")
+            with pytest.raises(ValueError):
+                HeartbeatClient(channel, TOKEN, DEVICE_ID, interval=0)
+        finally:
+            await channel.close()
+
+    asyncio.run(_run())
 
 
 # --- Wire shape ---------------------------------------------------------------
