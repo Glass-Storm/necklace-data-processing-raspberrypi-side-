@@ -180,15 +180,19 @@ def _dispatch(
         pair,
     )
 
+    from ecosys_pi.discovery import HubNotFoundError, resolve_hub
+
     cfg = load_config(env)
     hub = args.hub or cfg.hub
     if not hub:
-        _emit(
-            out,
-            "error: no hub address; pass --hub HOST:PORT or set PI_ECOSYS_HUB "
-            "(mDNS discovery is not implemented in this build)",
-        )
-        return EXIT_ERROR
+        # No explicit override or PI_ECOSYS_HUB: fall back to a bounded mDNS
+        # browse. Discovery failures are normal (the hub only advertises while
+        # its service runs), so they land on the frozen `error:` line + exit 1.
+        try:
+            hub = resolve_hub(args.hub, environ=env)
+        except HubNotFoundError as exc:
+            _emit(out, f"error: {exc}")
+            return EXIT_ERROR
 
     if args.frames < 0:
         _emit(out, f"error: --frames must be >= 0, got {args.frames}")
