@@ -88,7 +88,6 @@ __all__ = [
     "FRAME_INTERVAL_SECONDS",
     "FRAME_MS",
     "MAX_BUFFERED_FRAMES",
-    "MAX_QUEUE_DEPTH",
     "SAMPLES_PER_FRAME",
     "SYNTHETIC_FRAME_BYTES",
     "WIRE_SAMPLE_RATE_HZ",
@@ -128,10 +127,6 @@ CAPTURE_BLOCK_SAMPLES = 1024
 #: same 20 ms cadence, so this only absorbs jitter; excess is dropped, never
 #: allowed to grow RAM without bound.
 MAX_BUFFERED_FRAMES = 32
-#: The hub's audio queue depth (see ``docs/PROTOCOL_DECISIONS.md``). Documented
-#: here so the producer's bound is explicit even though the bound itself lives in
-#: task 8's ``asyncio.Queue(64)``.
-MAX_QUEUE_DEPTH = 64
 
 #: Environment variable selecting the audio source: ``auto`` (default),
 #: ``synthetic``, ``sounddevice``, or ``arecord``.
@@ -325,11 +320,6 @@ class _PcmFrameBuffer:
                 return frame
         return None
 
-    def clear(self) -> None:
-        """Discard all buffered bytes (used when speech starts)."""
-        with self._lock:
-            self._buf.clear()
-
     @property
     def dropped_frames(self) -> int:
         """Whole frames dropped because the consumer fell behind."""
@@ -479,7 +469,19 @@ class SoundDeviceAudioSource:
                 device=self._device,
                 callback=self._on_block,
             )
-            stream.start()
+            try:
+                stream.start()
+            except Exception:
+                # A stream that was constructed but failed to start must not be
+                # leaked; tear it down before reporting unavailable. Mirror the
+                # camera's open()-failure cleanup and never let teardown raise.
+                try:
+                    stream.close()
+                except Exception as close_exc:  # noqa: BLE001
+                    print(
+                        f"[Pi Audio] error while discarding the mic stream: {close_exc}"
+                    )
+                raise
         except Exception as exc:  # noqa: BLE001 - hardware failure => keep running
             print(f"[Pi Audio] could not open the microphone: {exc}")
             return False

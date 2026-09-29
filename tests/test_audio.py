@@ -380,6 +380,55 @@ def test_sounddevice_source_open_returns_false_without_portaudio() -> None:
     source.close()
 
 
+class _FailingStartStream:
+    """A stand-in ``InputStream`` whose ``start()`` raises, recording close()."""
+
+    instances: list["_FailingStartStream"] = []
+
+    def __init__(self, **_kwargs: object) -> None:
+        self.started = 0
+        self.closed = 0
+        _FailingStartStream.instances.append(self)
+
+    def start(self) -> None:
+        self.started += 1
+        raise RuntimeError("simulated PortAudio start failure")
+
+    def stop(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def test_sounddevice_open_closes_stream_when_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing ``stream.start()`` must close the constructed stream, not leak it.
+
+    Reproduces the leak: ``InputStream(...)`` succeeded but ``start()`` raised, so
+    ``open()`` returned False while leaving the PortAudio stream open. The created
+    stream's ``close()`` must be called exactly once.
+    """
+    import sys
+    import types
+
+    from ecosys_pi.audio import SoundDeviceAudioSource
+
+    _FailingStartStream.instances = []
+    fake = types.ModuleType("sounddevice")
+    fake.InputStream = _FailingStartStream
+    monkeypatch.setitem(sys.modules, "sounddevice", fake)
+
+    source = SoundDeviceAudioSource()
+    assert source.open() is False
+    assert len(_FailingStartStream.instances) == 1
+    stream = _FailingStartStream.instances[0]
+    assert stream.started == 1
+    assert stream.closed == 1, "partially-started stream leaked on failure"
+    assert source._stream is None
+
+
 def test_module_imports_without_sounddevice() -> None:
     """audio.py must import on a host with no PortAudio (lazy import)."""
     import ecosys_pi.audio as audio
