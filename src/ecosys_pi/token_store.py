@@ -179,7 +179,11 @@ class TokenStore:
         try:
             fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, _FILE_MODE)
             os.fchmod(fd, _FILE_MODE)
-            os.write(fd, payload)
+            # ``os.write`` may perform a SHORT write; loop until every byte is
+            # persisted so the credential file can never be silently truncated.
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(fd, payload[offset:])
             os.fsync(fd)
             os.close(fd)
             fd = -1

@@ -194,6 +194,31 @@ def test_first_write_crash_leaves_nothing(
     assert list(store.path.parent.iterdir()) == []
 
 
+def test_short_write_is_completed_and_fully_reloadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short ``os.write`` must not truncate the credential file.
+
+    Reproduces the silent-truncation bug: a single un-checked ``os.write`` could
+    persist only part of the JSON. Here every call writes one byte, so ``save``
+    must loop until the whole payload is on disk, and ``load`` must round-trip it.
+    """
+    real_write = os.write
+    calls = 0
+
+    def one_byte(fd: int, data: bytes) -> int:
+        nonlocal calls
+        calls += 1
+        return real_write(fd, data[:1])
+
+    monkeypatch.setattr(token_store_mod.os, "write", one_byte)
+    store = _store(tmp_path)
+    store.save(Credentials(token=TOKEN, device_id=DEVICE_ID))
+
+    assert calls > 1, "the payload was written in a single call; no short-write path"
+    assert store.load() == Credentials(token=TOKEN, device_id=DEVICE_ID)
+
+
 # --- corruption is treated as absent (no crash) -----------------------------
 
 
