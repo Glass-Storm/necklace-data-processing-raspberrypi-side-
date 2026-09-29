@@ -47,7 +47,7 @@ from __future__ import annotations
 import os
 import socket
 from dataclasses import dataclass
-from typing import Mapping
+from collections.abc import Mapping
 
 __all__ = [
     "DEFAULT_TTS_LANG",

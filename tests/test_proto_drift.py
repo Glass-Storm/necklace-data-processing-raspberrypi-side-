@@ -10,6 +10,7 @@ never silently passes, so a skipped run is visibly "unverified".
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -17,9 +18,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDORED_PROTO = REPO_ROOT / "proto" / "ecosys" / "v1" / "ecosys.proto"
 
-HUB_PROTO = Path(
-    "/home/chaos/workplace/fyp/phone-manager/contract/src/main/proto/"
-    "ecosys/v1/ecosys.proto"
+HUB_REPO = Path(os.environ.get("PI_HUB_REPO", str(REPO_ROOT.parent / "phone-manager")))
+HUB_PROTO = (
+    HUB_REPO / "contract" / "src" / "main" / "proto" / "ecosys" / "v1" / "ecosys.proto"
 )
 
 
