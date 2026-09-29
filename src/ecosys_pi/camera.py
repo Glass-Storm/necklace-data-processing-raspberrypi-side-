@@ -25,6 +25,15 @@ an unusually large IDR keyframe (which repeats SPS/PPS) well below the hard
 ``MAX_NAL_BYTES`` cap of **1 MiB** -- a 4x margin under the hub limit. This cap is
 why **no hub change is needed**: the Pi keeps every individual NAL comfortably
 below the server's inbound bound.
+
+Pending-buffer bound
+--------------------
+The encoder callback appends NALs faster than :meth:`Picamera2VideoSource.read_nal`
+drains them whenever the producer is parked on ``client.send`` backpressure. The
+pending queue is therefore **bounded** at ``MAX_PENDING_NALS`` NALs (see
+:data:`MAX_PENDING_NALS`): once full, a newly appended NAL evicts the OLDEST one,
+so Pi RAM can never grow without bound. At one NAL per frame and 30 fps this is
+about two seconds of captured video.
 """
 
 from __future__ import annotations
@@ -43,6 +52,7 @@ __all__ = [
     "DEFAULT_WIDTH",
     "HUB_INBOUND_LIMIT_BYTES",
     "MAX_NAL_BYTES",
+    "MAX_PENDING_NALS",
     "Picamera2VideoSource",
     "SYNTHETIC_START_CODE",
     "SyntheticVideoSource",
@@ -69,6 +79,13 @@ HUB_INBOUND_LIMIT_BYTES = 4 * 1024 * 1024
 
 #: Hard per-NAL cap enforced by this client: 1 MiB = 1/4 of the hub limit.
 MAX_NAL_BYTES = 1 * 1024 * 1024
+
+#: Upper bound on queued NALs between the encoder callback and ``read_nal``. The
+#: producer drains at the capture cadence, so this only absorbs the backpressure
+#: of a parked ``client.send`` (and encoder bursts); excess drops the OLDEST NAL.
+#: At 30 fps this is ~2 s of video, kept small so Pi RAM stays bounded even when
+#: the hub stops reading.
+MAX_PENDING_NALS = 60
 
 #: The synthetic frame shape pinned to ``tools/mockpeer/frames.go``.
 SYNTHETIC_START_CODE = b"\x00\x00\x00\x01"
@@ -265,7 +282,9 @@ def _make_annex_b_output(sink: MutableSequence[bytes], lock: threading.Lock) -> 
     class) is only required when a real encoder is actually being started. The
     returned object's ``outputframe`` appends each start-code-prefixed NAL to
     ``sink`` under ``lock``; NALs over ``MAX_NAL_BYTES`` are dropped so a single
-    frame can never approach the hub's inbound limit.
+    frame can never approach the hub's inbound limit. ``sink`` is expected to be a
+    bounded deque (see :data:`MAX_PENDING_NALS`), so a stalled consumer makes the
+    oldest NAL fall off instead of growing RAM without bound.
     """
     from picamera2.outputs import Output
 
@@ -305,6 +324,10 @@ class Picamera2VideoSource:
     on a host without the optional extra never fails. When the import or the
     hardware pipeline fails, :meth:`open` returns ``False`` (the camera-unavailable
     posture ported from the legacy OpenCV source) and the caller keeps running.
+
+    Queued NALs are bounded at :data:`MAX_PENDING_NALS`: if the encoder outruns
+    :meth:`read_nal` (e.g. the producer is parked on ``client.send``), appending a
+    NAL past the bound evicts the oldest, so RAM is capped.
     """
 
     def __init__(
@@ -320,7 +343,7 @@ class Picamera2VideoSource:
         self._framerate = framerate
         self._picam2: object | None = None
         self._encoder: object | None = None
-        self._pending: deque[bytes] = deque()
+        self._pending: deque[bytes] = deque(maxlen=MAX_PENDING_NALS)
         self._lock = threading.Lock()
 
     @property

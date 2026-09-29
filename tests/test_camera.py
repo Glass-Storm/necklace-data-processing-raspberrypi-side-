@@ -304,3 +304,43 @@ def test_picamera2_success_path_keeps_the_camera_open_and_starts_pipeline(
     source.close()
     assert _FakePicamera2.instances[0].stop_recording_calls == 1
     assert _FakePicamera2.instances[0].closed == 1
+
+
+# --- Pending NAL queue is bounded (backpressure must not grow Pi RAM) --------
+
+
+def _install_fake_picamera2_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``from picamera2.outputs import Output`` resolve without hardware."""
+    import types
+
+    outputs = types.ModuleType("picamera2.outputs")
+    outputs.Output = object
+    monkeypatch.setitem(sys.modules, "picamera2.outputs", outputs)
+
+
+def test_pending_nals_are_bounded_and_drop_the_oldest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """More NALs than the cap through the real append path evicts the OLDEST.
+
+    Reproduces the unbounded-buffer bug: the encoder callback runs while
+    ``read_nal`` is parked on ``client.send``, so a ``deque`` without ``maxlen``
+    grew RAM without limit. The queue must stay capped and retain the newest NALs.
+    """
+    _install_fake_picamera2_output(monkeypatch)
+    source = camera.Picamera2VideoSource()
+    output = camera._make_annex_b_output(source._pending, source._lock)
+
+    overflow = 5
+    pushed = camera.MAX_PENDING_NALS + overflow
+    for index in range(pushed):
+        output.outputframe(camera.synthetic_video_nal(index), keyframe=True)
+
+    pending = source._pending
+    assert len(pending) == camera.MAX_PENDING_NALS
+    assert list(pending) == [
+        camera.synthetic_video_nal(i) for i in range(overflow, pushed)
+    ]
+    # The oldest NALs fell off; read_nal drains newest-remaining first.
+    assert source.read_nal() == camera.synthetic_video_nal(overflow)
+    assert source.read_nal() == camera.synthetic_video_nal(overflow + 1)
