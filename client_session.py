@@ -25,6 +25,20 @@ HELLO_MESSAGE_TYPE = "hello"
 WARMUP_MESSAGE_TYPE = "starting"
 WARMUP_KEEPALIVE_INTERVAL_SECONDS = 1.0
 
+# While no camera is available the link is held open with a no_hand heartbeat
+# every second (well inside the app's ~5 s read timeout), retrying the camera
+# every CAMERA_RETRY_INTERVAL_SECONDS so one attached later starts streaming
+# without a reconnect.
+HOLD_HEARTBEAT_SECONDS = 1.0
+CAMERA_RETRY_INTERVAL_SECONDS = 10.0
+
+# If a frame takes longer than the app's ~5 s read timeout -- a slow camera, a
+# busy CPU, or a slow link -- the link would look dead. While a frame is being
+# processed the session re-sends the last update once a second to keep it
+# alive (and, when that update was a skeleton, to keep it on screen until the
+# next frame replaces it). On a healthy 10 fps stream it never fires.
+STREAM_HEARTBEAT_SECONDS = 1.0
+
 
 class ClientSession:
     """Owns a single accepted connection and its camera."""
@@ -51,6 +65,11 @@ class ClientSession:
         self._segmenter = segmenter
         self._stop_event = threading.Event()
         self._speech_thread: threading.Thread | None = None
+        # All socket writes go through this lock so the stream loop and the
+        # heartbeat thread cannot interleave partial JSON lines.
+        self._send_lock = threading.Lock()
+        self._last_payload: str | None = None
+        self._last_send_time = 0.0
 
     @property
     def address(self):
@@ -80,9 +99,16 @@ class ClientSession:
                 opened = video.open()
             finally:
                 self._stop_warmup_keepalive(stopped, keepalive)
-            if not opened:
-                return
-            self._stream_frames(video)
+            hb_stop, heartbeat = self._start_heartbeat()
+            try:
+                if not opened:
+                    # No camera: keep the phone connected instead of dropping it.
+                    self._hold_without_camera(video)
+                    return
+                self._stream_frames(video)
+            finally:
+                hb_stop.set()
+                heartbeat.join(timeout=2 * STREAM_HEARTBEAT_SECONDS)
         finally:
             video.close()
             self._stop_event.set()
@@ -131,6 +157,52 @@ class ClientSession:
         except OSError:
             pass
 
+    def _safe_send(self, payload: str, context: str, track: bool = True) -> bool:
+        """Send one JSON line under the send lock; remember it for heartbeats.
+
+        All writes go through here so the stream loop and the heartbeat thread
+        cannot interleave partial lines on the socket. Returns False when the
+        send failed (the phone is gone).
+        """
+        data = (payload + "\n").encode("utf-8")
+        with self._send_lock:
+            try:
+                self._connection.sendall(data)
+            except OSError as exc:
+                print(f"[Pi Node] Send failed ({exc}). {context}")
+                return False
+            if track:
+                # Only stream payloads are repeated by the heartbeat; the
+                # greeting is not (a phone must never see hello twice).
+                self._last_payload = payload
+            self._last_send_time = time.monotonic()
+            return True
+
+    def _start_heartbeat(self) -> tuple[threading.Event, threading.Thread]:
+        """Re-send the last line every second while a frame is being processed.
+
+        If a frame takes longer than the app's read timeout, the app sees
+        silence and drops the link. Re-sending the last update keeps the phone
+        connected and, when that update was a skeleton, keeps it on screen
+        until the next frame replaces it.
+        """
+        stop = threading.Event()
+
+        def pump() -> None:
+            while not stop.wait(STREAM_HEARTBEAT_SECONDS):
+                if time.monotonic() - self._last_send_time < STREAM_HEARTBEAT_SECONDS:
+                    continue
+                payload = self._last_payload
+                if payload is None:
+                    payload = json.dumps(
+                        {"type": NO_HAND_MESSAGE_TYPE, "timestamp": time.time()}
+                    )
+                self._safe_send(payload, "Phone disconnected.")
+
+        heartbeat = threading.Thread(target=pump, name="stream-heartbeat", daemon=True)
+        heartbeat.start()
+        return stop, heartbeat
+
     def _send_hello(self) -> bool:
         """Announce this node to the client. Returns False if it already left."""
         payload = json.dumps(
@@ -141,14 +213,9 @@ class ClientSession:
                 "protocol": 1,
                 "port": PORT,
             }
-        ) + "\n"
-        try:
-            self._connection.sendall(payload.encode("utf-8"))
-        except OSError as exc:
-            # The probe disconnected immediately after reading — expected.
-            print(f"[Pi Node] Client left during handshake ({exc}).")
-            return False
-        return True
+        )
+        # The probe disconnected immediately after reading — expected.
+        return self._safe_send(payload, "Client left during handshake.", track=False)
 
     def _send_landmarks(self, captured) -> bool:
         """Send the 21 landmark coordinates for one hand.
@@ -164,13 +231,8 @@ class ClientSession:
                 "hand": captured.handedness,
                 "timestamp": time.time(),
             }
-        ) + "\n"
-        try:
-            self._connection.sendall(payload.encode("utf-8"))
-        except OSError as exc:
-            print(f"[Pi Node] Send failed ({exc}). Phone disconnected.")
-            return False
-        return True
+        )
+        return self._safe_send(payload, "Phone disconnected.")
 
     def _send_no_hand(self) -> bool:
         """Tell the phone no hand is in view instead of sending an image.
@@ -184,14 +246,8 @@ class ClientSession:
                 "type": NO_HAND_MESSAGE_TYPE,
                 "timestamp": time.time(),
             }
-        ) + "\n"
-        try:
-            self._connection.sendall(payload.encode("utf-8"))
-        except OSError as exc:
-            print(f"[Pi Node] Send failed ({exc}). Phone disconnected.")
-            return False
-        return True
-
+        )
+        return self._safe_send(payload, "Phone disconnected.")
 
     def _stream_frames(self, video: VideoStream) -> None:
         while not self._stop_event.is_set():
@@ -209,6 +265,28 @@ class ClientSession:
                 return
             time.sleep(FRAME_INTERVAL_SECONDS)
 
+    def _hold_without_camera(self, video: VideoStream) -> None:
+        """Keep the phone connected while no camera is available.
+
+        Closing the socket the moment the camera fails makes the phone see
+        "connection lost" and reconnect in a loop. Instead keep the link up:
+        retry the camera, and while it is still missing send the same no_hand
+        marker the stream uses when the hand is out of view, so the phone
+        stays connected and simply shows "no hand".
+        """
+        print("[Pi Camera] No camera; holding the link open with no_hand.")
+        next_open_attempt = time.monotonic()
+        while not self._stop_event.is_set():
+            if not self._send_no_hand():
+                return
+            now = time.monotonic()
+            if now >= next_open_attempt:
+                next_open_attempt = now + CAMERA_RETRY_INTERVAL_SECONDS
+                if video.open():
+                    self._stream_frames(video)
+                    return
+            time.sleep(HOLD_HEARTBEAT_SECONDS)
+
     def _send_frame(self, encoded_image: str) -> bool:
         payload = json.dumps(
             {
@@ -216,13 +294,8 @@ class ClientSession:
                 "image": encoded_image,
                 "timestamp": time.time(),
             }
-        ) + "\n"
-        try:
-            self._connection.sendall(payload.encode("utf-8"))
-        except OSError as exc:
-            print(f"[Pi Node] Send failed ({exc}). Phone disconnected.")
-            return False
-        return True
+        )
+        return self._safe_send(payload, "Phone disconnected.")
 
     def _start_speech_listener(self) -> None:
         self._speech_thread = threading.Thread(

@@ -20,6 +20,7 @@ import cv2
 
 from config import (
     CAMERA_INDEX,
+    CAMERA_SOURCE,
     CROP_MARGIN,
     DETECT_EVERY_N_FRAMES,
     FRAME_HEIGHT,
@@ -66,6 +67,7 @@ class VideoStream:
         detector: HandDetector | None = None,
         segmenter: BackgroundRemover | None = None,
         camera_index: int = CAMERA_INDEX,
+        camera_source: str = CAMERA_SOURCE,
         width: int = FRAME_WIDTH,
         height: int = FRAME_HEIGHT,
         jpeg_quality: int = JPEG_QUALITY,
@@ -76,6 +78,7 @@ class VideoStream:
         self._segmenter = segmenter
         self._send_landmarks = detector is not None and PRIVACY_MODE == "landmarks"
         self._camera_index = camera_index
+        self._camera_source = camera_source
         self._width = width
         self._height = height
         self._jpeg_quality = jpeg_quality
@@ -93,10 +96,15 @@ class VideoStream:
         self._last_handedness: str | None = None
 
     def open(self) -> bool:
-        """Open the camera. Returns False when no device is available."""
-        self._capture = cv2.VideoCapture(self._camera_index)
+        """Open the camera. Returns False when no source is available.
+
+        Uses CAMERA_SOURCE when set (a URL or video file), otherwise the
+        device index.
+        """
+        source = self._camera_source or self._camera_index
+        self._capture = cv2.VideoCapture(source)
         if not self._capture.isOpened():
-            print(f"[Pi Camera] Could not open camera index {self._camera_index}")
+            print(f"[Pi Camera] Could not open camera source {source!r}")
             self.close()
             return False
 
@@ -109,7 +117,7 @@ class VideoStream:
         else:
             mode = "full frame"
         print(
-            f"[Pi Camera] Opened index {self._camera_index} "
+            f"[Pi Camera] Opened source {source!r} "
             f"at {self._width}x{self._height} ({mode})"
         )
         return True

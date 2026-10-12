@@ -13,6 +13,12 @@ PORT = int(os.environ.get("PI_NODE_PORT", "8765"))
 
 # Camera / JPEG settings
 CAMERA_INDEX = int(os.environ.get("PI_NODE_CAMERA_INDEX", "0"))
+
+# Optional capture-source override: a URL or path used verbatim as the OpenCV
+# capture source instead of CAMERA_INDEX. Handy for testing without a camera
+# (point it at a video file) or reading a network stream. Empty means "use
+# CAMERA_INDEX".
+CAMERA_SOURCE = os.environ.get("PI_NODE_CAMERA_SOURCE", "").strip()
 FRAME_WIDTH = int(os.environ.get("PI_NODE_FRAME_WIDTH", "320"))
 FRAME_HEIGHT = int(os.environ.get("PI_NODE_FRAME_HEIGHT", "240"))
 JPEG_QUALITY = int(os.environ.get("PI_NODE_JPEG_QUALITY", "50"))

@@ -44,6 +44,33 @@ def mediapipe_available() -> bool:
     return True
 
 
+def cpu_supports_aes() -> bool:
+    """True when this CPU advertises the AES instruction.
+
+    MediaPipe's native libraries are built with AES enabled and abort the
+    whole process -- "compiled with aes enabled, but this feature is not
+    available on this processor" -- when the CPU lacks it. That abort happens
+    inside native code, so Python cannot catch it: importing the package
+    succeeds, and the process dies the first time a model runs. Checking the
+    CPU flag first is the only reliable way to know whether MediaPipe can be
+    used at all.
+    """
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.lower().startswith("features"):
+                    return "aes" in line.split(":", 1)[1].split()
+    except OSError:
+        pass
+    # Not Linux, or /proc is unavailable: do not block detection on a guess.
+    return True
+
+
+def mediapipe_usable() -> bool:
+    """True when MediaPipe is installed *and* this CPU can run it."""
+    return mediapipe_available() and cpu_supports_aes()
+
+
 def bbox_from_landmarks(
     xs: list[float],
     ys: list[float],

@@ -18,7 +18,8 @@ import socket
 from audio_output import is_playback_available, playback_unavailable_reason
 from client_session import ClientSession
 from config import CROP_MARGIN, HOST, LISTEN_BACKLOG, MODEL_PATH, PORT, PRIVACY_MODE
-from hand_detector import HandDetector, mediapipe_available
+from dnn_hand_detector import DnnHandDetector, dnn_available
+from hand_detector import HandDetector, mediapipe_available, mediapipe_usable
 from segmenter import BackgroundRemover, segmenter_available
 from config import SEGMENTER_MODEL_PATH
 
@@ -44,13 +45,8 @@ def create_detector() -> HandDetector | None:
     if PRIVACY_MODE not in ("crop", "landmarks"):
         print(f"[Pi Privacy] Unknown PI_NODE_PRIVACY='{PRIVACY_MODE}', using 'landmarks'.")
 
-    if not mediapipe_available():
-        print("[Pi Privacy] FATAL: PI_NODE_PRIVACY=crop but mediapipe is missing.")
-        print("[Pi Privacy] Fix with: pip install mediapipe  (64-bit OS required)")
-        raise SystemExit(1)
-
     try:
-        detector = HandDetector(MODEL_PATH, margin=CROP_MARGIN)
+        detector = build_hand_detector()
     except (FileNotFoundError, RuntimeError) as exc:
         print(f"[Pi Privacy] FATAL: {exc}")
         raise SystemExit(1) from exc
@@ -58,6 +54,45 @@ def create_detector() -> HandDetector | None:
     what = "landmark coordinates only" if PRIVACY_MODE == "landmarks" else "hand crops only"
     print(f"[Pi Privacy] {PRIVACY_MODE} mode on: {what} leave this device.")
     return detector
+
+
+def build_hand_detector() -> HandDetector | DnnHandDetector:
+    """Build a hand detector with whichever backend this machine can run.
+
+    MediaPipe is preferred when it loads. It does not on every board: its
+    native library is built with the ARMv8 AES instruction, and on a CPU
+    without it the import kills the process. In that case the same
+    ``hand_landmarker.task`` models are run through OpenCV's DNN module, which
+    needs no AES, so the landmarks mode works either way.
+
+    Returns:
+        The detector, whichever backend it came from.
+
+    Raises:
+        RuntimeError: neither backend can run.
+    """
+    if mediapipe_usable():
+        try:
+            return HandDetector(MODEL_PATH, margin=CROP_MARGIN)
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f"[Pi Privacy] MediaPipe detector unavailable: {exc}")
+    elif mediapipe_available():
+        # Importing mediapipe succeeds even on a CPU its native code cannot
+        # run on; using it aborts the process instead of raising. Say so.
+        print("[Pi Privacy] mediapipe is installed but this CPU has no AES "
+              "instruction, which its native code requires. Using OpenCV.")
+    else:
+        print("[Pi Privacy] mediapipe is not installed. Using OpenCV.")
+
+    if not dnn_available():
+        raise RuntimeError(
+            "no usable hand detector: mediapipe is missing and this OpenCV "
+            "has no cv2.dnn.readNetFromTFLite (needs opencv-python 4.5.4+)"
+        )
+
+    print("[Pi Privacy] Using the bundled TFLite models through OpenCV "
+          "(no MediaPipe needed).")
+    return DnnHandDetector(MODEL_PATH, margin=CROP_MARGIN)
 
 
 def create_segmenter() -> BackgroundRemover | None:
