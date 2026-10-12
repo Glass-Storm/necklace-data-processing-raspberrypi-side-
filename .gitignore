@@ -2,3 +2,18 @@ venv/
 __pycache__/
 *.pyc
 *.log
+
+# The hand landmarker model is a build asset copied from the Android repo
+# (NecklaceDataProcessing/app/src/main/assets/hand_landmarker.task), not a
+# source file. Copy it into models/ when deploying; PI_NODE_MODEL_PATH
+# points at it. Keeping the 7.8 MB binary out of git avoids two copies of
+# the same asset drifting apart across the two repos.
+models/
+
+# Offline test scripts and their artifacts. Development aids, not shipped
+# code, so they stay untracked. The scripts resolve their paths relative to
+# their own location, so they work no matter where they are invoked from.
+test/
+test_hand_photo.jpg
+crop_debug_*.png
+scene_debug.png

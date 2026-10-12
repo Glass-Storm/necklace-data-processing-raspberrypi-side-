@@ -1,0 +1,26 @@
+# Raspberry Pi node dependencies.
+#
+# Install inside a virtual environment (Bookworm blocks system-wide pip):
+#   python3 -m venv venv
+#   source venv/bin/activate
+#   pip install -r requirements.txt
+#
+# mediapipe needs a 64-bit OS: check with `uname -m` -> aarch64.
+# If the Pi runs 32-bit Raspberry Pi OS, reflash with the 64-bit image.
+
+# Hand landmark detection for the privacy crop (hand_detector.py).
+# The model file itself is NOT a pip package: it is hand_landmarker.task in
+# models/, the same file the Android hub bundles in app/src/main/assets/.
+mediapipe>=0.10
+
+# Camera capture and JPEG encoding (video_stream.py).
+# apt's python3-opencv is an alternative, but keep versions consistent by
+# installing this one inside the venv.
+opencv-python>=4.8
+
+# Array handling for MediaPipe image input and PCM audio decoding.
+numpy>=1.24
+
+# Speaker playback (audio_output.py). Also needs the system PortAudio
+# library: sudo apt install libportaudio2
+sounddevice>=0.4.6

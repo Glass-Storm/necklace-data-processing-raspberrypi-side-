@@ -1,10 +1,13 @@
 """Entry point for the Raspberry Pi node.
 
-Streams webcam frames to the phone app over TCP using the JSON-lines protocol
+Streams hand crops to the phone app over TCP using the JSON-lines protocol
 the Android client already speaks, and plays back speech audio it sends.
 
 Protocol (unchanged):
   Pi   -> phone: {"type": "video_frame", "image": <base64 jpeg>, "timestamp": <float>}
+                  (in privacy crop mode the JPEG is a crop around the detected
+                   hand, never the full camera frame)
+  Pi   -> phone: {"type": "no_hand", "timestamp": <float>}
   phone -> Pi  : {"type": "speech_output", "text": str, "audio_data": <base64 pcm>, "sample_rate": int}
 Both directions are newline delimited JSON.
 """
@@ -13,9 +16,44 @@ import socket
 
 from audio_output import is_playback_available, playback_unavailable_reason
 from client_session import ClientSession
-from config import HOST, LISTEN_BACKLOG, PORT
+from config import CROP_MARGIN, HOST, LISTEN_BACKLOG, MODEL_PATH, PORT, PRIVACY_MODE
+from hand_detector import HandDetector, mediapipe_available
 
 BANNER_WIDTH = 52
+
+
+def create_detector() -> HandDetector | None:
+    """Build the hand detector when privacy cropping is enabled.
+
+    Runs once at startup so a broken setup fails loudly here instead of
+    quietly streaming full frames: the whole point of the crop is that a
+    full frame must never be sent by accident, so "detector unavailable"
+    is treated as fatal rather than degrading to aiming mode.
+
+    Returns:
+        The detector, or None when PI_NODE_PRIVACY=off (aiming mode).
+    """
+    if PRIVACY_MODE == "off":
+        print("[Pi Privacy] Crop mode OFF — full frames will be streamed.")
+        print("[Pi Privacy] Aiming mode only. Re-enable with PI_NODE_PRIVACY=crop.")
+        return None
+
+    if PRIVACY_MODE != "crop":
+        print(f"[Pi Privacy] Unknown PI_NODE_PRIVACY='{PRIVACY_MODE}', using 'crop'.")
+
+    if not mediapipe_available():
+        print("[Pi Privacy] FATAL: PI_NODE_PRIVACY=crop but mediapipe is missing.")
+        print("[Pi Privacy] Fix with: pip install mediapipe  (64-bit OS required)")
+        raise SystemExit(1)
+
+    try:
+        detector = HandDetector(MODEL_PATH, margin=CROP_MARGIN)
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f"[Pi Privacy] FATAL: {exc}")
+        raise SystemExit(1) from exc
+
+    print("[Pi Privacy] Crop mode on: only hand crops leave this device.")
+    return detector
 
 
 def discover_local_addresses() -> list[str]:
@@ -38,10 +76,11 @@ def discover_local_addresses() -> list[str]:
     return sorted({ip for ip in addresses if not ip.startswith("127.")})
 
 
-def print_startup_banner() -> None:
+def print_startup_banner(detector: HandDetector | None) -> None:
     print("=" * BANNER_WIDTH)
     print("[Pi Node] Camera + speech server starting")
     print(f"[Pi Node] Listening on {HOST}:{PORT}")
+    print(f"[Pi Node] Privacy mode: {PRIVACY_MODE} (model: {MODEL_PATH})")
     for address in discover_local_addresses():
         print(f"[Pi Node]   -> point the app at {address}:{PORT}")
     if is_playback_available():
@@ -61,13 +100,13 @@ def create_server() -> socket.socket:
     return server
 
 
-def serve_forever(server: socket.socket) -> None:
+def serve_forever(server: socket.socket, detector: HandDetector | None) -> None:
     """Accept phones one at a time, serving each until it disconnects."""
     while True:
         connection, address = server.accept()
         print(f"[Pi Node] Phone connected from {address[0]}:{address[1]}")
 
-        session = ClientSession(connection, address)
+        session = ClientSession(connection, address, detector=detector)
         try:
             session.run()
         except Exception as exc:  # keep the listener alive for the next phone
@@ -79,7 +118,10 @@ def serve_forever(server: socket.socket) -> None:
 
 
 def main() -> None:
-    print_startup_banner()
+    # Detector first: a privacy setup that cannot load must stop the node
+    # before a socket is ever opened.
+    detector = create_detector()
+    print_startup_banner(detector)
 
     try:
         server = create_server()
@@ -88,11 +130,13 @@ def main() -> None:
         raise SystemExit(1) from exc
 
     try:
-        serve_forever(server)
+        serve_forever(server, detector)
     except KeyboardInterrupt:
         print("\n[Pi Node] Shutting down.")
     finally:
         server.close()
+        if detector is not None:
+            detector.close()
 
 
 if __name__ == "__main__":

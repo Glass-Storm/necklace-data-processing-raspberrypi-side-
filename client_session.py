@@ -1,4 +1,9 @@
-"""Serves one connected phone: streams webcam frames out, plays speech in."""
+"""Serves one connected phone: streams hand crops out, plays speech in.
+
+In privacy crop mode the frames are crops around the detected hand, and a
+no_hand marker is sent instead of an image whenever the hand is out of view
+(see video_stream). The wire format is unchanged otherwise.
+"""
 
 import json
 import socket
@@ -7,19 +12,32 @@ import time
 
 from audio_output import play_speech_audio
 from config import DEFAULT_SAMPLE_RATE, DEVICE_ID, FRAME_INTERVAL_SECONDS, PORT
-from video_stream import VideoStream
+from video_stream import NO_HAND_MESSAGE_TYPE, VIDEO_MESSAGE_TYPE, VideoStream
 
 SPEECH_MESSAGE_TYPE = "speech_output"
-VIDEO_MESSAGE_TYPE = "video_frame"
 HELLO_MESSAGE_TYPE = "hello"
 
 
 class ClientSession:
     """Owns a single accepted connection and its camera."""
 
-    def __init__(self, connection: socket.socket, address) -> None:
+    def __init__(
+        self,
+        connection: socket.socket,
+        address,
+        detector=None,
+    ) -> None:
+        """Store the connection and the detector to stream with.
+
+        Args:
+            connection: the accepted TCP socket.
+            address: the phone's address, kept for logs.
+            detector: shared HandDetector, or None for full-frame aiming mode.
+                Shared across sessions because the model is expensive to load.
+        """
         self._connection = connection
         self._address = address
+        self._detector = detector
         self._stop_event = threading.Event()
         self._speech_thread: threading.Thread | None = None
 
@@ -37,7 +55,7 @@ class ClientSession:
         if not self._send_hello():
             return
 
-        video = VideoStream()
+        video = VideoStream(detector=self._detector)
         try:
             if not video.open():
                 return
@@ -78,14 +96,37 @@ class ClientSession:
             return False
         return True
 
+    def _send_no_hand(self) -> bool:
+        """Tell the phone no hand is in view instead of sending an image.
+
+        Sent every frame while the hand is absent: at 10 FPS the payload is
+        ~30 bytes, and the steady stream doubles as a liveness heartbeat, so
+        the phone can tell "no hand" from "link dead" by read timeout alone.
+        """
+        payload = json.dumps(
+            {
+                "type": NO_HAND_MESSAGE_TYPE,
+                "timestamp": time.time(),
+            }
+        ) + "\n"
+        try:
+            self._connection.sendall(payload.encode("utf-8"))
+        except OSError as exc:
+            print(f"[Pi Node] Send failed ({exc}). Phone disconnected.")
+            return False
+        return True
+
 
     def _stream_frames(self, video: VideoStream) -> None:
         while not self._stop_event.is_set():
-            encoded = video.read_encoded_frame()
-            if encoded is None:
+            captured = video.read_encoded_frame()
+            if captured is None:
                 print("[Pi Camera] Frame capture failed, ending stream.")
                 return
-            if not self._send_frame(encoded):
+            if captured.message_type == NO_HAND_MESSAGE_TYPE:
+                if not self._send_no_hand():
+                    return
+            elif captured.image is None or not self._send_frame(captured.image):
                 return
             time.sleep(FRAME_INTERVAL_SECONDS)
 
