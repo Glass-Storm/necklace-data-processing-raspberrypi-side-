@@ -3,12 +3,24 @@ __pycache__/
 *.pyc
 *.log
 
-# The hand landmarker model is a build asset copied from the Android repo
-# (NecklaceDataProcessing/app/src/main/assets/hand_landmarker.task), not a
-# source file. Copy it into models/ when deploying; PI_NODE_MODEL_PATH
-# points at it. Keeping the 7.8 MB binary out of git avoids two copies of
-# the same asset drifting apart across the two repos.
-models/
+# The hand landmarker model, copied from the Android repo's
+# app/src/main/assets/hand_landmarker.task.
+#
+# This WAS ignored, to avoid two copies of the same asset drifting apart.
+# That turned out to be the wrong trade: PRIVACY_MODE defaults to
+# "landmarks", which is the most model-dependent mode, so a fresh clone
+# killed the node at startup (HandDetector raises FileNotFoundError ->
+# SystemExit before a socket is ever opened) and landmark mode looked
+# simply "not implemented". The cost of the drift risk is one byte-identical
+# 7.8 MB file; the cost of the ignore was an unusable clone.
+#
+# The two copies are byte-for-byte identical (verified with fc /b,
+# 7,819,105 bytes). Re-copy and re-verify if the Android hub's model changes.
+#
+# Everything else under models/ stays untracked: selfie_segmenter.tflite is
+# only needed for PI_NODE_PRIVACY=segment, and is not a default path.
+models/*
+!models/hand_landmarker.task
 
 # Offline test scripts and their artifacts. Development aids, not shipped
 # code, so they stay untracked. The scripts resolve their paths relative to
