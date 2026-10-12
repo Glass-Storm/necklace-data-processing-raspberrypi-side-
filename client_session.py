@@ -18,6 +18,13 @@ from video_stream import HAND_LANDMARKS_MESSAGE_TYPE
 SPEECH_MESSAGE_TYPE = "speech_output"
 HELLO_MESSAGE_TYPE = "hello"
 
+# Sent once a second while the camera opens. The app ignores message types it
+# does not know, so this needs no change on the receiving side: it exists only
+# to keep the app's socket read timeout from expiring during the warm-up gap
+# between the greeting and the first real frame.
+WARMUP_MESSAGE_TYPE = "starting"
+WARMUP_KEEPALIVE_INTERVAL_SECONDS = 1.0
+
 
 class ClientSession:
     """Owns a single accepted connection and its camera."""
@@ -61,7 +68,19 @@ class ClientSession:
 
         video = VideoStream(detector=self._detector, segmenter=self._segmenter)
         try:
-            if not video.open():
+            # The greeting has already gone out, so as far as the app is
+            # concerned the link is live the moment the camera starts opening.
+            # Opening is not instant -- measured at 6.9 s on Windows with the
+            # default MSMF backend, nearly all of it in the two resolution
+            # set() calls -- while the app's read timeout is 5 s. Without a
+            # keep-alive the app sees silence, treats the link as dead, and
+            # reconnects in a loop that never streams a single frame.
+            stopped, keepalive = self._start_warmup_keepalive()
+            try:
+                opened = video.open()
+            finally:
+                self._stop_warmup_keepalive(stopped, keepalive)
+            if not opened:
                 return
             self._stream_frames(video)
         finally:
@@ -69,6 +88,37 @@ class ClientSession:
             self._stop_event.set()
             self.close()
             self._join_speech_listener()
+
+    def _start_warmup_keepalive(self) -> tuple[threading.Event, threading.Thread]:
+        """Pump a placeholder line while the camera is opening.
+
+        Returns the stop flag and the thread, so the caller can halt it before
+        streaming begins: two writers on one socket would interleave partial
+        JSON lines and corrupt the stream.
+        """
+        stop = threading.Event()
+
+        def pump() -> None:
+            while not stop.wait(WARMUP_KEEPALIVE_INTERVAL_SECONDS):
+                payload = json.dumps(
+                    {"type": WARMUP_MESSAGE_TYPE, "timestamp": time.time()}
+                ) + "\n"
+                try:
+                    self._connection.sendall(payload.encode("utf-8"))
+                except OSError:
+                    # The app gave up or left. The open() call below will fail
+                    # or the stream loop will notice; nothing to do here.
+                    return
+
+        keepalive = threading.Thread(target=pump, name="warmup-keepalive", daemon=True)
+        keepalive.start()
+        return stop, keepalive
+
+    @staticmethod
+    def _stop_warmup_keepalive(stop: threading.Event, keepalive: threading.Thread) -> None:
+        """Halt the pump and wait for it, so it cannot race _stream_frames."""
+        stop.set()
+        keepalive.join(timeout=2 * WARMUP_KEEPALIVE_INTERVAL_SECONDS)
 
     def close(self) -> None:
         """Shut the socket down so the reader thread unblocks."""

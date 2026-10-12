@@ -26,6 +26,7 @@ from config import (
     FRAME_WIDTH,
     JPEG_QUALITY,
     NO_HAND_GRACE_FRAMES,
+    PRIVACY_MODE,
 )
 from hand_detector import BoundingBox, HandDetector
 from segmenter import BackgroundRemover
