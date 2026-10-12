@@ -28,21 +28,33 @@ from config import (
     NO_HAND_GRACE_FRAMES,
 )
 from hand_detector import BoundingBox, HandDetector
+from segmenter import BackgroundRemover
 
 VIDEO_MESSAGE_TYPE = "video_frame"
 NO_HAND_MESSAGE_TYPE = "no_hand"
+HAND_LANDMARKS_MESSAGE_TYPE = "hand_landmarks"
+
+# Landmarks are rounded to 4 decimals before sending: 1e-4 of the frame is
+# ~0.03 px at 320 wide, far below landmark noise, and it roughly halves the
+# JSON payload (~500 B/frame vs ~1 KB unrounded).
+LANDMARK_DECIMALS = 4
 
 @dataclass
 class CapturedFrame:
     """One stream unit: either an encoded crop or a no-hand marker.
 
     Attributes:
-        message_type: VIDEO_MESSAGE_TYPE or NO_HAND_MESSAGE_TYPE.
+        message_type: VIDEO_MESSAGE_TYPE, HAND_LANDMARKS_MESSAGE_TYPE or
+            NO_HAND_MESSAGE_TYPE.
         image: base64 JPEG for a video frame, None for a no-hand marker.
+        landmarks: flat [x0, y0, z0, ... x20, y20, z20] for a landmarks frame.
+        handedness: the model's "Left"/"Right" label, display information only.
     """
 
     message_type: str
     image: str | None = None
+    landmarks: list[float] | None = None
+    handedness: str | None = None
 
 
 class VideoStream:
@@ -51,6 +63,7 @@ class VideoStream:
     def __init__(
         self,
         detector: HandDetector | None = None,
+        segmenter: BackgroundRemover | None = None,
         camera_index: int = CAMERA_INDEX,
         width: int = FRAME_WIDTH,
         height: int = FRAME_HEIGHT,
@@ -59,6 +72,8 @@ class VideoStream:
         detect_every_n: int = DETECT_EVERY_N_FRAMES,
     ) -> None:
         self._detector = detector
+        self._segmenter = segmenter
+        self._send_landmarks = detector is not None and PRIVACY_MODE == "landmarks"
         self._camera_index = camera_index
         self._width = width
         self._height = height
@@ -73,6 +88,8 @@ class VideoStream:
         self._last_bbox: BoundingBox | None = None
         self._frames_since_detection = 0
         self._frames_since_hand = 0
+        self._last_landmarks: list[float] | None = None
+        self._last_handedness: str | None = None
 
     def open(self) -> bool:
         """Open the camera. Returns False when no device is available."""
@@ -84,7 +101,12 @@ class VideoStream:
 
         self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
         self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
-        mode = "privacy crop" if self._detector is not None else "full frame"
+        if self._segmenter is not None:
+            mode = "background removal"
+        elif self._detector is not None:
+            mode = "privacy crop"
+        else:
+            mode = "full frame"
         print(
             f"[Pi Camera] Opened index {self._camera_index} "
             f"at {self._width}x{self._height} ({mode})"
@@ -107,11 +129,57 @@ class VideoStream:
 
         resized = cv2.resize(frame, (self._width, self._height))
 
+        if self._segmenter is not None:
+            # Segment mode: the full frame, scene removed. The wrist and the
+            # hand's natural scale are preserved, which live testing showed
+            # the hub's detector prefers over re-framed crops.
+            cleaned = self._segmenter.apply(resized)
+            return self._encode(cleaned, VIDEO_MESSAGE_TYPE)
+
+        if self._send_landmarks:
+            return self._landmark_pipeline(resized)
+
         if self._detector is None:
             # Aiming mode: no detector configured, full frame is the payload.
             return self._encode(resized, VIDEO_MESSAGE_TYPE)
 
         return self._crop_pipeline(resized)
+
+    # -------------------------------------------------------------------
+    # Landmarks pipeline (privacy-max: no image data leaves the device)
+    # -------------------------------------------------------------------
+
+    def _landmark_pipeline(self, frame) -> CapturedFrame:
+        """Detect landmarks on the full frame; send coordinates only."""
+        points, handedness = self._detector.detect_landmarks(frame)
+
+        if points is None:
+            # Detection lost the hand. Hold the last landmarks for the grace
+            # period so the phone's skeleton does not flicker on a single
+            # dropped detection — same policy as crop mode.
+            self._frames_since_hand += 1
+            if self._last_landmarks is not None and self._frames_since_hand <= self._grace_frames:
+                return CapturedFrame(
+                    message_type=HAND_LANDMARKS_MESSAGE_TYPE,
+                    landmarks=self._last_landmarks,
+                    handedness=self._last_handedness,
+                )
+            self._last_landmarks = None
+            return CapturedFrame(message_type=NO_HAND_MESSAGE_TYPE)
+
+        self._frames_since_hand = 0
+        flat = [
+            round(value, LANDMARK_DECIMALS)
+            for point in points
+            for value in point
+        ]
+        self._last_landmarks = flat
+        self._last_handedness = handedness
+        return CapturedFrame(
+            message_type=HAND_LANDMARKS_MESSAGE_TYPE,
+            landmarks=flat,
+            handedness=handedness,
+        )
 
     # -------------------------------------------------------------------
     # Privacy crop pipeline

@@ -187,6 +187,40 @@ class HandDetector:
             margin=self._margin,
         )
 
+    def detect_landmarks(self, frame_bgr: np.ndarray):
+        """Return (points, handedness) for the first hand, or (None, None).
+
+        Points are 21 (x, y, z) tuples in normalised coordinates, exactly the
+        values MediaPipe returns — the format the landmarks wire mode sends
+        and the phone's classifier consumes. Handedness is the model's label
+        ("Left"/"Right"), display information only.
+        """
+        try:
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            mp_image = self._mp.Image(
+                image_format=self._mp.ImageFormat.SRGB,
+                data=np.ascontiguousarray(rgb),
+            )
+            result = self._landmarker.detect(mp_image)
+        except Exception as exc:  # noqa: BLE001 - never kill the stream loop
+            print(f"[Pi Privacy] Detection failed: {exc}")
+            return None, None
+
+        hands = result.hand_landmarks
+        if not hands:
+            return None, None
+
+        landmarks = hands[0]
+        points = [(lm.x, lm.y, lm.z) for lm in landmarks]
+        label = None
+        try:
+            categories = result.handedness[0]
+            if categories:
+                label = categories[0].category_name
+        except (IndexError, AttributeError):
+            label = None
+        return points, label
+
     def close(self) -> None:
         """Release the native model. Safe to call more than once."""
         try:

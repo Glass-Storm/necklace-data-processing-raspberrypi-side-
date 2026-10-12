@@ -13,6 +13,7 @@ import time
 from audio_output import play_speech_audio
 from config import DEFAULT_SAMPLE_RATE, DEVICE_ID, FRAME_INTERVAL_SECONDS, PORT
 from video_stream import NO_HAND_MESSAGE_TYPE, VIDEO_MESSAGE_TYPE, VideoStream
+from video_stream import HAND_LANDMARKS_MESSAGE_TYPE
 
 SPEECH_MESSAGE_TYPE = "speech_output"
 HELLO_MESSAGE_TYPE = "hello"
@@ -26,6 +27,7 @@ class ClientSession:
         connection: socket.socket,
         address,
         detector=None,
+        segmenter=None,
     ) -> None:
         """Store the connection and the detector to stream with.
 
@@ -34,10 +36,12 @@ class ClientSession:
             address: the phone's address, kept for logs.
             detector: shared HandDetector, or None for full-frame aiming mode.
                 Shared across sessions because the model is expensive to load.
+            segmenter: shared BackgroundRemover for segment mode, or None.
         """
         self._connection = connection
         self._address = address
         self._detector = detector
+        self._segmenter = segmenter
         self._stop_event = threading.Event()
         self._speech_thread: threading.Thread | None = None
 
@@ -55,7 +59,7 @@ class ClientSession:
         if not self._send_hello():
             return
 
-        video = VideoStream(detector=self._detector)
+        video = VideoStream(detector=self._detector, segmenter=self._segmenter)
         try:
             if not video.open():
                 return
@@ -96,6 +100,28 @@ class ClientSession:
             return False
         return True
 
+    def _send_landmarks(self, captured) -> bool:
+        """Send the 21 landmark coordinates for one hand.
+
+        The flat array is [x0, y0, z0, ... x20, y20, z20], normalised 0-1,
+        rounded to 4 decimals by the stream. ~500 bytes, roughly 50x smaller
+        than a JPEG frame: the Wi-Fi link stops being a constraint.
+        """
+        payload = json.dumps(
+            {
+                "type": HAND_LANDMARKS_MESSAGE_TYPE,
+                "lm": captured.landmarks,
+                "hand": captured.handedness,
+                "timestamp": time.time(),
+            }
+        ) + "\n"
+        try:
+            self._connection.sendall(payload.encode("utf-8"))
+        except OSError as exc:
+            print(f"[Pi Node] Send failed ({exc}). Phone disconnected.")
+            return False
+        return True
+
     def _send_no_hand(self) -> bool:
         """Tell the phone no hand is in view instead of sending an image.
 
@@ -125,6 +151,9 @@ class ClientSession:
                 return
             if captured.message_type == NO_HAND_MESSAGE_TYPE:
                 if not self._send_no_hand():
+                    return
+            elif captured.message_type == HAND_LANDMARKS_MESSAGE_TYPE:
+                if not self._send_landmarks(captured):
                     return
             elif captured.image is None or not self._send_frame(captured.image):
                 return

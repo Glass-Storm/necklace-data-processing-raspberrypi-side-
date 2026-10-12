@@ -28,9 +28,23 @@ FRAME_INTERVAL_SECONDS = 1.0 / STREAM_FPS
 #   "crop" - every captured frame runs through hand detection and only a crop
 #            around the detected hand is encoded and sent. A full frame is
 #            never encoded or transmitted.
+#   "segment" - the full frame is sent with the scene background blacked out
+#            (MediaPipe selfie segmentation). The hand keeps its natural
+#            scale and the wrist stays in frame, which live testing showed
+#            recognises better than crop; the scene itself is never sent.
+#   "landmarks" - NO image is ever sent. MediaPipe runs on the full frame here
+#            and only the 21 landmark coordinates leave the device. Recognised
+#            best of all modes in live testing: one detection on the full
+#            frame, no re-detection flicker on the hub, ~50x less bandwidth.
 #   "off"  - full frames are streamed. Aiming/mounting mode only; opt-in.
-# Unknown values fall back to "crop" (privacy-safe default, checked at startup).
-PRIVACY_MODE = os.environ.get("PI_NODE_PRIVACY", "crop").strip().lower()
+# Unknown values fall back to "landmarks" (privacy-max default, checked at
+# startup).
+PRIVACY_MODE = os.environ.get("PI_NODE_PRIVACY", "landmarks").strip().lower()
+
+# Selfie segmentation model for the 'segment' mode (segmenter.py). ~250 KB.
+SEGMENTER_MODEL_PATH = os.environ.get(
+    "PI_NODE_SEGMENTER_MODEL", "models/selfie_segmenter.tflite"
+)
 
 # MediaPipe hand landmarker model. The same hand_landmarker.task file the
 # Android hub bundles in app/src/main/assets/, so both ends share one model.
