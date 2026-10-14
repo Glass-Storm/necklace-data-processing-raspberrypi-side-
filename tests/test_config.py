@@ -17,7 +17,9 @@ from ecosys_pi.config import (
     DEFAULT_ENROLLMENT_SECONDS,
     DEFAULT_HUB_PORT,
     DEFAULT_TTS_LANG,
+    DEFAULT_WIFI_SECURITY,
     SUPPORTED_TTS_LANGS,
+    SUPPORTED_WIFI_SECURITY,
     Config,
     load_config,
 )
@@ -40,7 +42,6 @@ def test_defaults_when_environment_is_empty(monkeypatch: pytest.MonkeyPatch) -> 
     cfg = load_config({})
 
     assert cfg.hub is None
-    assert cfg.pin is None
     assert cfg.tts_lang == DEFAULT_TTS_LANG == "yue"
     assert cfg.device_name == "pi-bench"
 
@@ -49,14 +50,14 @@ def test_environment_overrides_every_value() -> None:
     cfg = load_config(
         {
             "PI_ECOSYS_HUB": "192.168.1.10:50051",
-            "PI_ECOSYS_PIN": "482915",
+            "PI_ECOSYS_WIFI_SECURITY": "wpa3",
             "PI_ECOSYS_TTS_LANG": "en",
             "PI_ECOSYS_DEVICE_NAME": "front-door-pi",
         }
     )
 
     assert cfg.hub == "192.168.1.10:50051"
-    assert cfg.pin == "482915"
+    assert cfg.wifi_security == "wpa3"
     assert cfg.tts_lang == "en"
     assert cfg.device_name == "front-door-pi"
 
@@ -67,15 +68,13 @@ def test_blank_values_are_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> N
     cfg = load_config(
         {
             "PI_ECOSYS_HUB": "   ",
-            "PI_ECOSYS_PIN": "",
             "PI_ECOSYS_TTS_LANG": "   ",
             "PI_ECOSYS_DEVICE_NAME": "  ",
         }
     )
 
-    # hub/pin are absent; lang falls back; device name falls back to hostname.
+    # hub is absent; lang falls back; device name falls back to hostname.
     assert cfg.hub is None
-    assert cfg.pin is None
     assert cfg.tts_lang == DEFAULT_TTS_LANG
     assert cfg.device_name == "host-pi"
 
@@ -108,13 +107,16 @@ def test_device_name_never_blank_when_hostname_is_empty(
     assert cfg.device_name == "ecosys-pi"
 
 
-def test_pin_is_never_leaked_by_repr() -> None:
-    cfg = load_config({"PI_ECOSYS_PIN": "top-secret-pin"})
+def test_wifi_security_defaults_and_overrides() -> None:
+    assert load_config({}).wifi_security == DEFAULT_WIFI_SECURITY == "wpa2"
+    assert load_config({"PI_ECOSYS_WIFI_SECURITY": "wpa3"}).wifi_security == "wpa3"
 
-    text = repr(cfg)
 
-    assert "top-secret-pin" not in text
-    assert "<set>" in text
+def test_unknown_wifi_security_falls_back_to_wpa2() -> None:
+    cfg = load_config({"PI_ECOSYS_WIFI_SECURITY": "wep"})
+
+    assert cfg.wifi_security == DEFAULT_WIFI_SECURITY
+    assert cfg.wifi_security in SUPPORTED_WIFI_SECURITY
 
 
 def test_load_config_reads_os_environ_when_not_passed(
@@ -122,7 +124,6 @@ def test_load_config_reads_os_environ_when_not_passed(
 ) -> None:
     monkeypatch.setenv("PI_ECOSYS_HUB", "127.0.0.1:9")
     monkeypatch.setenv("PI_ECOSYS_TTS_LANG", "zh")
-    monkeypatch.delenv("PI_ECOSYS_PIN", raising=False)
 
     cfg = load_config()
 
@@ -164,6 +165,7 @@ def test_new_fields_have_documented_defaults(
 
     assert cfg.ssid is None
     assert cfg.password is None
+    assert cfg.wifi_security == DEFAULT_WIFI_SECURITY == "wpa2"
     assert cfg.enrollment_seconds == DEFAULT_ENROLLMENT_SECONDS == 8
     assert cfg.hub_port == DEFAULT_HUB_PORT == 50051
 
@@ -175,12 +177,12 @@ def test_config_file_values_are_loaded(tmp_path: Path) -> None:
         {
             "ssid": "ecosys-hotspot",
             "password": "hunter2",
+            "wifi_security": "wpa3",
             "tts_lang": "zh",
             "device_name": "necklace",
             "enrollment_seconds": 12,
             "hub_port": 60061,
             "hub": "10.0.0.5:50051",
-            "pin": "482915",
         },
     )
 
@@ -188,12 +190,12 @@ def test_config_file_values_are_loaded(tmp_path: Path) -> None:
 
     assert cfg.ssid == "ecosys-hotspot"
     assert cfg.password == "hunter2"
+    assert cfg.wifi_security == "wpa3"
     assert cfg.tts_lang == "zh"
     assert cfg.device_name == "necklace"
     assert cfg.enrollment_seconds == 12
     assert cfg.hub_port == 60061
     assert cfg.hub == "10.0.0.5:50051"
-    assert cfg.pin == "482915"
 
 
 def test_dotenv_overrides_config_file(tmp_path: Path) -> None:
@@ -392,14 +394,12 @@ def test_default_paths_discovered_from_cwd_when_environ_not_injected(
 
 
 def test_password_is_never_leaked_by_repr() -> None:
-    cfg = load_config(
-        {"PI_ECOSYS_HOTSPOT_PASSWORD": "top-secret-pw", "PI_ECOSYS_PIN": "123456"}
-    )
+    cfg = load_config({"PI_ECOSYS_HOTSPOT_PASSWORD": "top-secret-pw"})
 
     text = repr(cfg)
 
     assert "top-secret-pw" not in text
-    assert "123456" not in text
+    assert "<set>" in text
 
 
 def test_config_example_documents_every_setting(tmp_path: Path) -> None:
@@ -420,5 +420,6 @@ def test_config_example_documents_every_setting(tmp_path: Path) -> None:
     assert cfg.password is not None
     assert cfg.tts_lang in SUPPORTED_TTS_LANGS
     assert cfg.device_name
+    assert cfg.wifi_security == DEFAULT_WIFI_SECURITY
     assert cfg.enrollment_seconds == DEFAULT_ENROLLMENT_SECONDS
     assert cfg.hub_port == DEFAULT_HUB_PORT

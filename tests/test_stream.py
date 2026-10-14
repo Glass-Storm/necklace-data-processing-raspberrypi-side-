@@ -62,6 +62,9 @@ class FakeHub(ecosys_pb2_grpc.StreamServiceServicer):
         abort_calls: dict[int, grpc.StatusCode] | None = None,
         emit_tts: bool = False,
         emit_gesture: bool = False,
+        emit_result: bool = False,
+        result_text: str = "hello",
+        result_speaker: str = "",
     ) -> None:
         self.transcript_on_audio = transcript_on_audio
         self.require_token = require_token
@@ -70,6 +73,10 @@ class FakeHub(ecosys_pb2_grpc.StreamServiceServicer):
         # audio frame, so the receive path is exercised without any device.
         self.emit_tts = emit_tts
         self.emit_gesture = emit_gesture
+        # The hub's REAL transcription frame (`result`), emitted per audio frame.
+        self.emit_result = emit_result
+        self.result_text = result_text
+        self.result_speaker = result_speaker
         self._extras_sent = False
         # When set, the hub reads NOTHING until it is released -- this is what
         # makes the client's write() hit transport backpressure.
@@ -114,6 +121,14 @@ class FakeHub(ecosys_pb2_grpc.StreamServiceServicer):
                     self.transcripts_sent += 1
                     yield ecosys_pb2.StreamFrame(
                         transcript=f"mock:{len(frame.audio_pcm16_16k)}"
+                    )
+                if self.emit_result and frame.HasField("audio_pcm16_16k"):
+                    yield ecosys_pb2.StreamFrame(
+                        result=ecosys_pb2.StreamResult(
+                            text=self.result_text,
+                            speaker_label=self.result_speaker,
+                            pts_ms=1,
+                        )
                     )
                 if not self._extras_sent and frame.HasField("audio_pcm16_16k"):
                     self._extras_sent = True
@@ -466,5 +481,78 @@ def test_all_three_payloads_reach_their_callbacks() -> None:
     asyncio.run(
         asyncio.wait_for(
             _scenario_all_payloads_reach_their_callbacks(), timeout=TIMEOUT
+        )
+    )
+
+
+async def _scenario_result_frame_dispatch() -> None:
+    # The hub's REAL transcription frame: `result`, not the legacy `transcript`.
+    hub = FakeHub(transcript_on_audio=False, emit_result=True, result_speaker="Alice")
+    server, target = await _start_hub(hub)
+    channel = aio.insecure_channel(target)
+    transcripts: list[str] = []
+    labels: list[str] = []
+
+    try:
+        client = StreamClient(
+            channel,
+            TOKEN,
+            transcripts.append,
+            on_speaker_label=labels.append,
+        )
+        run_task = asyncio.create_task(client.run())
+        await client.send(_audio_frame(0))
+
+        await _wait_until(lambda: bool(transcripts and labels))
+
+        client.close()
+        await asyncio.wait_for(run_task, timeout=TIMEOUT)
+
+        assert transcripts == ["hello"]
+        assert labels == ["Alice"]
+    finally:
+        await channel.close()
+        await _stop_hub(server)
+
+
+def test_result_frame_dispatches_text_and_speaker_label() -> None:
+    """A `result` frame's text reaches on_transcript, its label the label callback."""
+    asyncio.run(asyncio.wait_for(_scenario_result_frame_dispatch(), timeout=TIMEOUT))
+
+
+async def _scenario_result_without_speaker_skips_label() -> None:
+    hub = FakeHub(transcript_on_audio=False, emit_result=True, result_speaker="")
+    server, target = await _start_hub(hub)
+    channel = aio.insecure_channel(target)
+    transcripts: list[str] = []
+    labels: list[str] = []
+
+    try:
+        client = StreamClient(
+            channel,
+            TOKEN,
+            transcripts.append,
+            on_speaker_label=labels.append,
+        )
+        run_task = asyncio.create_task(client.run())
+        await client.send(_audio_frame(0))
+
+        await _wait_until(lambda: len(transcripts) == 1)
+
+        client.close()
+        await asyncio.wait_for(run_task, timeout=TIMEOUT)
+
+        assert transcripts == ["hello"]
+        assert labels == []
+    finally:
+        await channel.close()
+        await _stop_hub(server)
+
+
+def test_result_frame_without_a_speaker_label_skips_the_label_callback() -> None:
+    """An untagged `result` still dispatches its text, with no label callback."""
+    asyncio.run(
+        asyncio.wait_for(
+            _scenario_result_without_speaker_skips_label(), timeout=TIMEOUT
         )
     )

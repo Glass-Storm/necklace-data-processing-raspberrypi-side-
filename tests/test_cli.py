@@ -8,9 +8,10 @@ task-14 E2E harness will observe: the process stdout and exit code.
 Coverage:
 
 * ``--help`` lists every runtime flag (and no pairing flag);
-* a happy path opens the stream UNAUTHENTICATED (no bearer token, no pairing)
-  and prints ``transcript ...`` then exits ``0``;
-* a session with no PIN streams frames;
+* a happy path opens the stream UNAUTHENTICATED (no bearer token, no pairing),
+  and a hub emission in the REAL ``result`` shape is printed as ``transcript``;
+* the necklace is VIDEO-ONLY by default: no microphone frame is uploaded unless
+  the operator opts in with ``--enable-audio`` / ``PI_ECOSYS_ENABLE_AUDIO``;
 * the video pump (JPEG stills, pacing, cap, bounded termination).
 """
 
@@ -37,15 +38,18 @@ SUBPROCESS_TIMEOUT_S = 60.0
 class FakeHub(ecosys_pb2_grpc.StreamServiceServicer):
     """An in-process hub for ``OpenStream``, with NO auth gate.
 
-    It records the stream's invocation metadata so a test can prove the client
-    never sends an ``authorization`` header: pairing was removed from the
-    runtime, so the stream opens unauthenticated. ``OpenStream`` yields one
-    ``transcript`` per received audio frame, mirroring the hub's mock STT adapter
-    shape ``mock:<len>:<hash>``.
+    It mirrors the REAL hub: a transcribed frame is emitted as a ``result``
+    (``StreamResult``), never the legacy ``transcript`` string, so the CLI's
+    ``result`` dispatch is exercised end to end. One ``result`` is yielded per
+    received audio OR image frame. It records the stream's invocation metadata
+    (so a test can prove the client sends no ``authorization`` header) and counts
+    the audio/image frames, so a test can prove the necklace uploads no
+    microphone frames by default.
     """
 
     def __init__(self) -> None:
         self.audio_frames = 0
+        self.image_frames = 0
         self.stream_metadata: list[dict[str, str]] = []
 
     def OpenStream(self, request_iterator, context):  # noqa: N802 - gRPC method name
@@ -54,7 +58,14 @@ class FakeHub(ecosys_pb2_grpc.StreamServiceServicer):
             if frame.HasField("audio_pcm16_16k"):
                 self.audio_frames += 1
                 yield ecosys_pb2.StreamFrame(
-                    transcript=f"mock:{len(frame.audio_pcm16_16k)}"
+                    result=ecosys_pb2.StreamResult(
+                        text=f"mock:{len(frame.audio_pcm16_16k)}"
+                    )
+                )
+            elif frame.HasField("image"):
+                self.image_frames += 1
+                yield ecosys_pb2.StreamFrame(
+                    result=ecosys_pb2.StreamResult(text=f"mock:{len(frame.image.jpeg)}")
                 )
 
 
@@ -88,7 +99,11 @@ def _cli_env(target: str | None, config_home: str) -> dict[str, str]:
     env["XDG_CONFIG_HOME"] = config_home
     env["PI_ECOSYS_AUDIO_SOURCE"] = "synthetic"
     env["PI_ECOSYS_VIDEO_SOURCE"] = "synthetic"
-    for key in ("PI_ECOSYS_HUB", "PI_ECOSYS_PIN", "PI_ECOSYS_TTS_LANG"):
+    for key in (
+        "PI_ECOSYS_HUB",
+        "PI_ECOSYS_TTS_LANG",
+        "PI_ECOSYS_ENABLE_AUDIO",
+    ):
         env.pop(key, None)
     if target is not None:
         env["PI_ECOSYS_HUB"] = target
@@ -122,7 +137,7 @@ def test_help_lists_the_runtime_flags() -> None:
     )
     assert result.returncode == 0
     help_text = result.stdout
-    for flag in ("--hub", "--mode", "--frames", "--lang"):
+    for flag in ("--hub", "--mode", "--frames", "--lang", "--enable-audio"):
         assert flag in help_text, f"{flag} missing from --help"
     # Pairing/PIN were removed from the runtime, so their flags are gone.
     assert "--pin" not in help_text
@@ -133,22 +148,70 @@ def test_help_lists_the_runtime_flags() -> None:
 
 
 def test_session_opens_unauthenticated_without_a_pin_and_exits_zero(tmp_path) -> None:
-    """A hub with no auth gate: the stream opens with no PIN and no token."""
+    """A hub with no auth gate: the stream opens with no PIN and no token.
+
+    The fake hub emits the REAL ``result`` frame, so a ``transcript`` line here
+    proves the reader consumes that frame (the legacy ``transcript`` field the
+    hub no longer sends).
+    """
     hub = FakeHub()
     with RunningHub(hub) as target:
         env = _cli_env(target, str(tmp_path))
         # No --pin, no cached token: the session must simply run.
-        result = _run_cli(["--mode", "audio", "--frames", "3"], env=env)
+        result = _run_cli(["--mode", "video", "--frames", "3"], env=env)
 
     lines = result.stdout.splitlines()
     assert result.returncode == 0, result.stderr
     assert not any(line.startswith("pair-") for line in lines), "no pairing line"
     transcripts = [line for line in lines if line.startswith("transcript ")]
     assert transcripts, f"no transcript lines in {lines!r}"
-    assert all(re.fullmatch(r"transcript mock:640", line) for line in transcripts)
-    assert hub.audio_frames >= 1
+    assert all(re.fullmatch(r"transcript mock:\d+", line) for line in transcripts)
+    assert hub.image_frames >= 1
+    # Video-only: no microphone frame left the Pi.
+    assert hub.audio_frames == 0
     # Pairing was removed: the stream carries no bearer token.
     assert all("authorization" not in md for md in hub.stream_metadata)
+
+
+# --- The necklace is video-only unless audio upload is explicitly opted in ----
+
+
+def test_default_mode_is_video_only_and_sends_no_audio(tmp_path) -> None:
+    """No ``--mode``: the default session sends JPEG stills and NO mic audio."""
+    hub = FakeHub()
+    with RunningHub(hub) as target:
+        env = _cli_env(target, str(tmp_path))
+        result = _run_cli(["--frames", "2"], env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert hub.image_frames >= 1, "the default must still stream images"
+    assert hub.audio_frames == 0, "the default must NOT upload microphone audio"
+
+
+def test_audio_mode_without_the_opt_in_sends_no_audio(tmp_path) -> None:
+    """``--mode audio`` alone is not enough: mic upload needs an explicit opt-in."""
+    hub = FakeHub()
+    with RunningHub(hub) as target:
+        env = _cli_env(target, str(tmp_path))
+        result = _run_cli(["--mode", "audio", "--frames", "2"], env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert hub.audio_frames == 0
+    assert "opt-in" in result.stderr
+
+
+def test_enable_audio_flag_opts_into_microphone_upload(tmp_path) -> None:
+    """``--enable-audio`` (the explicit opt-in) restores the audio producer."""
+    hub = FakeHub()
+    with RunningHub(hub) as target:
+        env = _cli_env(target, str(tmp_path))
+        result = _run_cli(
+            ["--mode", "audio", "--enable-audio", "--frames", "3"], env=env
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert hub.audio_frames >= 1
+    assert hub.image_frames == 0
 
 
 # --- Video pump: JPEG stills, None is "not ready", not "exhausted" (bug M2) --

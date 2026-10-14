@@ -29,8 +29,8 @@ Settings
 ========================  ============================  ==========================
 Setting                   Canonical env var             Default
 ========================  ============================  ==========================
-``hub``                   ``PI_ECOSYS_HUB``             *(unset)* → mDNS discovery
-``pin``                   ``PI_ECOSYS_PIN``             *(unset)* → console prompt
+``hub``                   ``PI_ECOSYS_HUB``             *(unset)* → gateway discover
+``wifi_security``         ``PI_ECOSYS_WIFI_SECURITY``   ``wpa2``
 ``tts_lang``              ``PI_ECOSYS_TTS_LANG``        ``yue``
 ``device_name``           ``PI_ECOSYS_DEVICE_NAME``     ``socket.gethostname()``
 ``ssid``                  ``PI_ECOSYS_SSID``            *(unset)*
@@ -41,11 +41,10 @@ Setting                   Canonical env var             Default
 
 Inside a ``.env`` or ``config.json`` file a setting may be spelled either with
 its canonical ``PI_ECOSYS_*`` name or with its short key (e.g. ``ssid``); the
-match is case-insensitive. ``PI_ECOSYS_PIN`` is **scripting only** — the PIN is
-single-use with a 120 s TTL, so it is not durable config.
+match is case-insensitive.
 
-The PIN and the hotspot password are secrets: :meth:`Config.__repr__` redacts
-both so they can never leak through a stray ``print``/log of the config object.
+The hotspot password is a secret: :meth:`Config.__repr__` redacts it so it can
+never leak through a stray ``print``/log of the config object.
 
 systemd service-user caveat
 ---------------------------
@@ -54,10 +53,7 @@ This module reads the *process environment*. A systemd unit started for a
 service user (``User=ecosys``) gets a **fresh, minimal environment** - it does
 NOT inherit your login shell's exports. Set variables with ``Environment=`` /
 ``EnvironmentFile=`` in the unit, or point ``PI_ECOSYS_*`` at a ``.env`` /
-``config.json`` file, or the defaults apply. The same caveat applies to
-``XDG_CONFIG_HOME`` used by :mod:`ecosys_pi.token_store`: if the service user has
-no ``XDG_CONFIG_HOME``, the cache lands in that user's ``~/.config`` and the
-service account must own that directory with mode ``0700``.
+``config.json`` file, or the defaults apply.
 """
 
 from __future__ import annotations
@@ -78,7 +74,9 @@ __all__ = [
     "DEFAULT_ENROLLMENT_SECONDS",
     "DEFAULT_HUB_PORT",
     "DEFAULT_TTS_LANG",
+    "DEFAULT_WIFI_SECURITY",
     "SUPPORTED_TTS_LANGS",
+    "SUPPORTED_WIFI_SECURITY",
     "Config",
     "load_config",
 ]
@@ -95,6 +93,13 @@ DEFAULT_ENROLLMENT_SECONDS: int = 8
 
 #: Default hub gRPC port, used when only the gateway host is known.
 DEFAULT_HUB_PORT: int = 50051
+
+#: Wi-Fi security modes ``nmcli`` may join. Mirrors
+#: :data:`ecosys_pi.network.SUPPORTED_SECURITY`.
+SUPPORTED_WIFI_SECURITY: frozenset[str] = frozenset({"wpa2", "wpa3"})
+
+#: Security used when ``wifi_security`` is blank or unknown.
+DEFAULT_WIFI_SECURITY: str = "wpa2"
 
 #: File discovered in the working directory for the dotenv layer.
 DEFAULT_DOTENV_FILENAME: str = ".env"
@@ -114,7 +119,7 @@ _MAX_PORT = 65535
 #: ``PI_ECOSYS_`` are ever read from the real process environment.
 _SETTING_ALIASES: Mapping[str, tuple[str, ...]] = {
     "hub": ("PI_ECOSYS_HUB", "hub"),
-    "pin": ("PI_ECOSYS_PIN", "pin"),
+    "wifi_security": ("PI_ECOSYS_WIFI_SECURITY", "wifi_security"),
     "tts_lang": ("PI_ECOSYS_TTS_LANG", "tts_lang"),
     "device_name": ("PI_ECOSYS_DEVICE_NAME", "device_name"),
     "ssid": ("PI_ECOSYS_SSID", "ssid"),
@@ -249,37 +254,37 @@ class Config:
     """Immutable, validated runtime configuration.
 
     Build it with :func:`load_config` rather than calling the constructor so the
-    environment/file parsing and fallbacks are applied consistently. The four
-    original fields are positional for backward compatibility; the task-13
-    fields (``ssid``/``password``/``enrollment_seconds``/``hub_port``) all carry
-    defaults so existing keyword constructions keep working unchanged.
+    environment/file parsing and fallbacks are applied consistently. The three
+    original fields are positional for backward compatibility; every later field
+    (``ssid``/``password``/``wifi_security``/``enrollment_seconds``/``hub_port``)
+    carries a default so existing keyword constructions keep working unchanged.
     """
 
-    #: ``HOST:PORT`` hub override, or ``None`` to use mDNS discovery.
+    #: ``HOST:PORT`` hub override, or ``None`` to use default-gateway discovery.
     hub: str | None
-    #: Scripting-only PIN override, or ``None`` to prompt on the console.
-    pin: str | None
     #: One of :data:`SUPPORTED_TTS_LANGS`; always valid after :func:`load_config`.
     tts_lang: str
-    #: Non-blank device label sent in ``PairRequest.device_name``.
+    #: Non-blank device label sent in the ``stream_open`` frame.
     device_name: str
     #: Hotspot SSID the Pi joins (task 12), or ``None`` when unset.
     ssid: str | None = None
     #: Hotspot WPA2/WPA3 password (task 12), or ``None`` when unset. A secret.
     password: str | None = None
+    #: One of :data:`SUPPORTED_WIFI_SECURITY`; the ``nmcli`` key-management scheme.
+    wifi_security: str = DEFAULT_WIFI_SECURITY
     #: Voice-enrolment capture length in seconds (task 13).
     enrollment_seconds: int = DEFAULT_ENROLLMENT_SECONDS
     #: Hub gRPC port, used when only the gateway host is known (task 12).
     hub_port: int = DEFAULT_HUB_PORT
 
     def __repr__(self) -> str:
-        # NEVER leak the PIN or the hotspot password through repr/print/logging.
-        pin = "<set>" if self.pin is not None else "<unset>"
+        # NEVER leak the hotspot password through repr/print/logging.
         password = "<set>" if self.password is not None else "<unset>"
         return (
-            f"Config(hub={self.hub!r}, pin={pin}, tts_lang={self.tts_lang!r}, "
+            f"Config(hub={self.hub!r}, tts_lang={self.tts_lang!r}, "
             f"device_name={self.device_name!r}, ssid={self.ssid!r}, "
-            f"password={password}, enrollment_seconds={self.enrollment_seconds!r}, "
+            f"password={password}, wifi_security={self.wifi_security!r}, "
+            f"enrollment_seconds={self.enrollment_seconds!r}, "
             f"hub_port={self.hub_port!r})"
         )
 
@@ -303,8 +308,8 @@ def load_config(
     (default: the current working directory). A blank
     ``PI_ECOSYS_TTS_LANG`` - or one outside :data:`SUPPORTED_TTS_LANGS` - falls
     back to :data:`DEFAULT_TTS_LANG` (``yue``). A blank device name falls back to
-    the hostname; the result is always non-blank so the hub never reports
-    ``name-missing``.
+    the hostname; the result is always non-blank. A blank or unknown
+    ``PI_ECOSYS_WIFI_SECURITY`` falls back to :data:`DEFAULT_WIFI_SECURITY`.
 
     This function never mutates ``os.environ``: the ``.env`` file is parsed with
     :func:`python_dotenv.dotenv_values`, not ``load_dotenv``.
@@ -328,13 +333,17 @@ def load_config(
     if lang not in SUPPORTED_TTS_LANGS:
         lang = DEFAULT_TTS_LANG
 
+    security = merged.get("wifi_security")
+    if security not in SUPPORTED_WIFI_SECURITY:
+        security = DEFAULT_WIFI_SECURITY
+
     return Config(
         hub=merged.get("hub"),
-        pin=merged.get("pin"),
         tts_lang=lang,
         device_name=merged.get("device_name") or _default_device_name(),
         ssid=merged.get("ssid"),
         password=merged.get("password"),
+        wifi_security=security,
         enrollment_seconds=_bounded_int(
             merged.get("enrollment_seconds"),
             DEFAULT_ENROLLMENT_SECONDS,

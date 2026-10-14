@@ -127,7 +127,7 @@ def test_cli_seam_uses_the_discovered_hub_without_pairing(
 
     used: dict[str, object] = {}
 
-    async def fake_session(hub, *, mode, frames, env, out, err):
+    async def fake_session(hub, *, mode, frames, enable_audio, env, out, err):
         used["hub"] = hub
         return cli.EXIT_OK
 

@@ -2,8 +2,9 @@
 
 The Raspberry Pi peer for the `ecosys.v1` device ecosystem. It joins the phone's
 hotspot by hand, opens an **UNAUTHENTICATED** gRPC stream to the `phone-manager`
-hub, streams **JPEG stills** (320×240) and microphone (PCM16) media, and plays
-the audio the hub synthesizes. It no longer pairs, heartbeats, or synthesizes
+hub, streams **JPEG stills** (320×240), and plays the audio the hub synthesizes.
+Microphone (PCM16) upload is **opt-in** — the necklace is a constrained device
+and is video-only by default. It no longer pairs, heartbeats, or synthesizes
 speech locally.
 
 This is the client that replaced the old raw TCP/JSON node. `python -m ecosys_pi`
@@ -28,9 +29,11 @@ the Pi is a **DHCP client** that joins the hotspot.
    and no mDNS; `--hub` / `PI_ECOSYS_HUB` override the gateway.
 2. **Stream** — one UNAUTHENTICATED `OpenStream`: the Pi opens it with a
    `stream_open` frame that binds its device id/role, then pushes `image`
-   (320×240 JPEG stills at ~10 fps) and/or `audio_pcm16_16k` (640-byte, 20 ms
-   frames) frames. The hub sends back `gesture` text and `tts_audio` (PCM16 @
-   16 kHz), which the Pi plays; a legacy `transcript` frame is logged to stdout.
+   (320×240 JPEG stills at ~10 fps) frames — and `audio_pcm16_16k` (640-byte,
+   20 ms frames) only when microphone upload is explicitly opted in. The hub
+   sends back `gesture` text and `tts_audio` (PCM16 @ 16 kHz), which the Pi
+   plays; a `result` (transcription) frame is printed as the frozen
+   `transcript <text>` line.
 3. **No heartbeat** — liveness is implied by the open stream; a transport loss
    simply reconnects.
 
@@ -113,22 +116,23 @@ uv run python -m ecosys_pi --help         # the CLI
 ### Running the client
 
 ```bash
-# Join the hotspot from config (SSID/password) and stream both media to the
-# gateway hub.
+# Join the hotspot from config (SSID/password) and stream video to the gateway
+# hub (the default; microphone upload is opt-in).
 uv run python -m ecosys_pi
 
-# Scripted: explicit hub, audio only, 100 frames.
-uv run python -m ecosys_pi --hub 192.168.43.1:50051 --mode audio --frames 100
+# Scripted: explicit hub, microphone audio only (explicit opt-in), 100 frames.
+uv run python -m ecosys_pi --hub 192.168.43.1:50051 --mode audio --enable-audio --frames 100
 ```
 
 ### CLI flags
 
-| Flag                        | Default | Meaning                                                  |
-| --------------------------- | ------- | -------------------------------------------------------- |
-| `--hub HOST:PORT`           | (unset) | Hub address, overriding `PI_ECOSYS_HUB` and the gateway. |
-| `--mode audio\|video\|both` | `both`  | Which media to stream.                                   |
-| `--frames N`                | `0`     | Frames per medium; `0` runs until interrupted.           |
-| `--lang yue\|zh\|en`        | (unset) | Retained for compatibility; the hub selects the voice.   |
+| Flag                        | Default | Meaning                                                           |
+| --------------------------- | ------- | ----------------------------------------------------------------- |
+| `--hub HOST:PORT`           | (unset) | Hub address, overriding `PI_ECOSYS_HUB` and the gateway.          |
+| `--mode audio\|video\|both` | `video` | Which media to stream. Microphone audio is video-only by default. |
+| `--enable-audio`            | off     | Explicit opt-in to microphone upload (`PI_ECOSYS_ENABLE_AUDIO`).  |
+| `--frames N`                | `0`     | Frames per medium; `0` runs until interrupted.                    |
+| `--lang yue\|zh\|en`        | (unset) | Retained for compatibility; the hub selects the voice.            |
 
 ### stdout / exit contract (frozen)
 
@@ -136,10 +140,10 @@ Automation (including the hub's JVM E2E harness) keys on stdout, so these lines
 are frozen. Informational chatter from the media/playback modules goes to
 **stderr**.
 
-| Line                | Meaning                               | Exit |
-| ------------------- | ------------------------------------- | ---- |
-| `transcript <text>` | One legacy transcript frame received. | 0    |
-| `error: <detail>`   | Anything else.                        | 1    |
+| Line                | Meaning                                          | Exit |
+| ------------------- | ------------------------------------------------ | ---- |
+| `transcript <text>` | One hub `result` (transcription) frame received. | 0    |
+| `error: <detail>`   | Anything else.                                   | 1    |
 
 ## Environment variables
 
@@ -149,6 +153,8 @@ are frozen. Informational chatter from the media/playback modules goes to
 | `PI_ECOSYS_SSID`               | (unset)                | Hotspot SSID the Pi joins with `nmcli`.                                                           |
 | `PI_ECOSYS_HOTSPOT_PASSWORD`   | (unset)                | Hotspot WPA2/WPA3 password. A secret: redacted in `Config.__repr__`.                              |
 | `PI_ECOSYS_HUB_PORT`           | `50051`                | Hub gRPC port appended to the gateway host.                                                       |
+| `PI_ECOSYS_WIFI_SECURITY`      | `wpa2`                 | `nmcli` key management: `wpa2` or `wpa3` (SAE).                                                   |
+| `PI_ECOSYS_ENABLE_AUDIO`       | (unset)                | Truthy (`1`/`true`/`yes`/`on`) opts into microphone upload; otherwise the necklace is video-only. |
 | `PI_ECOSYS_ENROLLMENT_SECONDS` | `8`                    | Voiceprint enrollment length (informational on the Pi).                                           |
 | `PI_ECOSYS_TTS_LANG`           | `yue`                  | Retained for compatibility; has no effect on the wire (the hub selects the voice).                |
 | `PI_ECOSYS_DEVICE_NAME`        | `socket.gethostname()` | Label sent in the `stream_open` frame; blank falls back to the hostname, then `ecosys-pi`.        |
@@ -169,9 +175,9 @@ are frozen. Informational chatter from the media/playback modules goes to
 - **The Pi does not synthesize speech.** The hub runs TTS and ships PCM16 @
   16 kHz; the Pi only plays it.
 - **The Pi does not run gesture recognition or diarization.** It sends JPEG
-  stills and mic audio; the hub decodes the stills, recognizes the gesture, runs
-  the speech/diarization engine, and fans the results out to the glasses and the
-  necklace.
+  stills — and mic audio only when explicitly opted in — while the hub decodes
+  the stills, recognizes the gesture, runs the speech/diarization engine, and
+  fans the results out to the glasses and the necklace.
 
 ## Adding a dependency
 

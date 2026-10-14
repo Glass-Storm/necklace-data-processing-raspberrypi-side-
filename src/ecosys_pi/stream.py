@@ -1,10 +1,9 @@
 """Concurrent bidirectional stream client for ``StreamService/OpenStream``.
 
 The hub's stream is LONG-LIVED (see ``docs/PROTOCOL_DECISIONS.md``): the Pi keeps
-sending audio/video frames and must keep reading hub frames -- exactly one
-``transcript`` per 20 ms audio chunk -- at the same time. The two directions are
-driven by two concurrent asyncio tasks over a single ``grpc.aio``
-stream-stream call:
+sending image frames and must keep reading hub frames -- transcripts, gesture
+text and playback audio -- at the same time. The two directions are driven by
+two concurrent asyncio tasks over a single ``grpc.aio`` stream-stream call:
 
 * a WRITER drains a BOUNDED ``asyncio.Queue`` and ``write()``s each frame. The
   bound is the backpressure valve: when the hub stops reading (its own 64-deep
@@ -12,7 +11,8 @@ stream-stream call:
   :meth:`StreamClient.send` blocks the media producer instead of buffering
   without limit.
 * a READER ``read()``s ``StreamFrame``s and dispatches each payload variant to
-  the caller's callback: a ``transcript`` and a ``gesture`` are text, while a
+  the caller's callback: a ``result`` (the hub's real transcription frame --
+  ``response.result.text``) and a legacy ``transcript``/``gesture`` are text, while a
   ``tts_audio`` carries the hub-synthesized PCM the necklace plays. A frame whose
   callback is unset is dropped silently, never raised into the reader.
 
@@ -64,6 +64,8 @@ TranscriptCallback = Callable[[str], Awaitable[None] | None]
 TtsAudioCallback = Callable[[bytes], Awaitable[None] | None]
 #: A ``gesture`` frame's recognized text handed to the log.
 GestureCallback = Callable[[str], Awaitable[None] | None]
+#: A ``result`` frame's speaker label, when the hub tagged one (empty = unknown).
+SpeakerLabelCallback = Callable[[str], Awaitable[None] | None]
 
 
 class StreamError(Exception):
@@ -71,7 +73,11 @@ class StreamError(Exception):
 
 
 class UnauthenticatedError(StreamError):
-    """The hub refused the bearer token: the caller MUST re-pair."""
+    """The hub answered UNAUTHENTICATED; the request is not usable as-is.
+
+    Pairing was removed from the runtime, so there is no re-pair to perform: a
+    UNAUTHENTICATED status is a fatal server-side condition and is never retried.
+    """
 
 
 class StreamTransportError(StreamError):
@@ -103,6 +109,7 @@ class StreamClient:
         *,
         on_tts_audio: TtsAudioCallback | None = None,
         on_gesture: GestureCallback | None = None,
+        on_speaker_label: SpeakerLabelCallback | None = None,
         queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
         max_reconnects: int = DEFAULT_MAX_RECONNECTS,
         reconnect_backoff: float = DEFAULT_RECONNECT_BACKOFF,
@@ -122,6 +129,7 @@ class StreamClient:
         # Optional per-payload callbacks: an unset one simply drops its frame.
         self._on_tts_audio = on_tts_audio
         self._on_gesture = on_gesture
+        self._on_speaker_label = on_speaker_label
         self._queue: asyncio.Queue[object] = asyncio.Queue(maxsize=queue_maxsize)
         self._shutdown = asyncio.Event()
         self._max_reconnects = max_reconnects
@@ -189,7 +197,8 @@ class StreamClient:
         """Drive the stream until :meth:`close` or an unrecoverable failure.
 
         Raises:
-            UnauthenticatedError: the hub refused the token (re-pair required).
+            UnauthenticatedError: the hub answered UNAUTHENTICATED (fatal; the
+                stream is unauthenticated, so there is no re-pair to perform).
             StreamTransportError: the stream was lost and the bounded reconnect
                 budget was exhausted.
         """
@@ -308,6 +317,14 @@ class StreamClient:
             payload = response.WhichOneof("payload")
             if payload == "transcript" and response.transcript:
                 await _dispatch(self._on_transcript, response.transcript)
+            elif payload == "result" and response.result.text:
+                # The hub's REAL transcription frame: dispatch the text to the
+                # transcript callback and, when present, the speaker label too.
+                await _dispatch(self._on_transcript, response.result.text)
+                if response.result.speaker_label and self._on_speaker_label is not None:
+                    await _dispatch(
+                        self._on_speaker_label, response.result.speaker_label
+                    )
             elif payload == "tts_audio" and self._on_tts_audio is not None:
                 pcm = response.tts_audio.pcm16_16k
                 if pcm:
@@ -321,7 +338,7 @@ def _classify(exc: aio.AioRpcError) -> StreamError:
     """Map a gRPC failure to the typed stream error."""
     if exc.code() == grpc.StatusCode.UNAUTHENTICATED:
         return UnauthenticatedError(
-            exc.details() or "hub rejected the bearer token; re-pair required"
+            exc.details() or "hub answered UNAUTHENTICATED; no retry"
         )
     return StreamTransportError(f"{exc.code().name}: {exc.details()}")
 

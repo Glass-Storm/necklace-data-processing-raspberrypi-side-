@@ -15,10 +15,15 @@ Flags
 
 =============================  =================================================
 ``--hub HOST:PORT``            Hub override (default: gateway discovery).
-``--mode audio|video|both``    Which media producers run (default ``both``).
+``--mode audio|video|both``    Which media producers run (default ``video``).
+``--enable-audio``             Opt in to mic upload (env ``PI_ECOSYS_ENABLE_AUDIO``).
 ``--frames N``                 Frames per medium; ``0`` = run until interrupted.
 ``--lang yue|zh|en``           Override ``PI_ECOSYS_TTS_LANG``.
 =============================  =================================================
+
+The necklace is a constrained device, so microphone capture is **opt-in**: the
+audio producer runs only when ``--enable-audio`` is passed (or the environment
+variable ``PI_ECOSYS_ENABLE_AUDIO`` is truthy). A default session is video-only.
 
 Frozen stdout / exit contract
 -----------------------------
@@ -62,14 +67,26 @@ STDOUT_CONTRACT = (
 #: Pace for the video pump: one JPEG still per capture frame (10 fps).
 _VIDEO_FRAME_INTERVAL_S = 0.1
 
+#: Environment variable that explicitly opts the necklace into microphone upload.
+ENABLE_AUDIO_ENV = "PI_ECOSYS_ENABLE_AUDIO"
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def audio_opted_in(env: Mapping[str, str]) -> bool:
+    """Whether microphone upload was explicitly requested via the environment."""
+    value = env.get(ENABLE_AUDIO_ENV)
+    return value is not None and value.strip().lower() in _TRUTHY
+
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the frozen runtime argument parser."""
     parser = argparse.ArgumentParser(
         prog="ecosys-pi",
         description=(
-            "Stream camera/microphone media to the phone-manager hub over an "
-            "unauthenticated stream, with hub-synthesized audio playback."
+            "Stream camera stills to the phone-manager hub over an "
+            "unauthenticated stream, with hub-synthesized audio playback. "
+            "Microphone upload is opt-in."
         ),
     )
     parser.add_argument(
@@ -81,8 +98,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         choices=("audio", "video", "both"),
-        default="both",
-        help="Which media to stream (default: both).",
+        default="video",
+        help="Which media to stream (default: video).",
+    )
+    parser.add_argument(
+        "--enable-audio",
+        action="store_true",
+        help=(
+            "Opt in to microphone upload (the necklace is video-only by "
+            "default); also honoured via PI_ECOSYS_ENABLE_AUDIO."
+        ),
     )
     parser.add_argument(
         "--frames",
@@ -145,7 +170,7 @@ def _dispatch(
             from ecosys_pi.network import NetworkError, join_hotspot
 
             try:
-                join_hotspot(cfg.ssid, cfg.password)
+                join_hotspot(cfg.ssid, cfg.password, security=cfg.wifi_security)
             except NetworkError as exc:
                 _emit(out, f"error: {exc}")
                 return EXIT_ERROR
@@ -165,6 +190,7 @@ def _dispatch(
                 hub,
                 mode=args.mode,
                 frames=args.frames,
+                enable_audio=args.enable_audio or audio_opted_in(env),
                 env=env,
                 out=out,
                 err=err,
@@ -180,11 +206,17 @@ async def _run_session(
     *,
     mode: str,
     frames: int,
+    enable_audio: bool,
     env: Mapping[str, str],
     out: IO[str],
     err: IO[str],
 ) -> int:
-    """Run the stream + media producers until the frame cap is reached."""
+    """Run the stream + media producers until the frame cap is reached.
+
+    Microphone capture is gated by ``enable_audio``: even ``--mode audio`` sends
+    nothing unless the operator opted in, so a constrained necklace never uploads
+    mic audio by accident.
+    """
     from grpc import aio
 
     from ecosys_pi.audio import (
@@ -198,9 +230,17 @@ async def _run_session(
     from ecosys_pi.tts import build_player
 
     max_frames = frames if frames > 0 else None
-    audio_enabled = mode in ("audio", "both")
+    audio_requested = mode in ("audio", "both")
+    audio_enabled = audio_requested and enable_audio
     video_enabled = mode in ("video", "both")
     received = 0
+
+    if audio_requested and not enable_audio:
+        print(
+            "[Pi Audio] microphone upload is opt-in; pass --enable-audio or set "
+            f"{ENABLE_AUDIO_ENV}=1 to enable it",
+            file=err,
+        )
 
     # ONE gate is shared by the capture source and the player, so capture is
     # muted for exactly the duration of hub-synthesized playback (half-duplex).

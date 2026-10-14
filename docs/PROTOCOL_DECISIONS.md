@@ -47,24 +47,28 @@ informational: the spoken meaning arrives as `tts_audio`.
 
 ## (e) Hub frames the Pi consumes
 
-The Pi's reader dispatches exactly three hub payload variants:
+The Pi's reader dispatches four hub payload variants:
 
 - `tts_audio` — played (section d).
 - `gesture` — its recognized text is logged to **stderr** (never the frozen
   stdout contract).
-- `transcript` — the legacy plain-text form; printed as the frozen
-  `transcript <text>` stdout line.
+- `result` — the hub's REAL transcription frame: `result.text` is printed as the
+  frozen `transcript <text>` stdout line, and `result.speaker_label`, when set,
+  is handed to an optional callback.
+- `transcript` — the legacy plain-text form, kept for wire compatibility and
+  printed the same way (the hub no longer emits it).
 
-`result` / `enroll_request` / `enroll_response` / `stream_open` are
-glasses-facing (or peer-to-hub) frames the necklace does not consume.
+`enroll_request` / `enroll_response` / `stream_open` are glasses-facing (or
+peer-to-hub) frames the necklace does not consume.
 
 ## (f) Hub discovery: `nmcli` hotspot join, then the default gateway
 
 The hub is the phone hotspot's access point, so the Pi:
 
 1. joins the hotspot from config with
-   `nmcli device wifi connect <ssid> password <pw>` (WPA2, or WPA3 personal with
-   `wifi-sec.key-mgmt sae`), then
+   `nmcli device wifi connect <ssid> password <pw>` (the `wifi_security` setting
+   selects WPA2, the default, or WPA3 personal with `wifi-sec.key-mgmt sae`),
+   then
 2. resolves the hub as the **default gateway** (`ip route`, falling back to
    `nmcli --terse --fields IP4.GATEWAY device show`) and appends the hub port.
 
