@@ -10,7 +10,7 @@ Flags (the harness uses ONLY these six)
 ---------------------------------------
 
 =============================  =================================================
-``--hub HOST:PORT``            Hub override (mDNS discovery is task 13).
+``--hub HOST:PORT``            Hub override (default: gateway discovery).
 ``--pin PIN``                  PIN override; forces ONE non-interactive Pair.
 ``--mode audio|video|both``    Which media producers run (default ``both``).
 ``--frames N``                 Frames per medium; ``0`` = run until interrupted.
@@ -100,7 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--hub",
         metavar="HOST:PORT",
         default=None,
-        help="Hub address, overriding PI_ECOSYS_HUB and mDNS discovery.",
+        help="Hub address, overriding PI_ECOSYS_HUB and gateway discovery.",
     )
     parser.add_argument(
         "--pin",
@@ -186,11 +186,19 @@ def _dispatch(
     cfg = load_config(env)
     hub = args.hub or cfg.hub
     if not hub:
-        # No explicit override or PI_ECOSYS_HUB: fall back to a bounded mDNS
-        # browse. Discovery failures are normal (the hub only advertises while
-        # its service runs), so they land on the frozen `error:` line + exit 1.
+        # The hub is the phone hotspot's access point: join the hotspot when
+        # credentials are configured, then dial the default gateway. With no
+        # credentials we still try the gateway (the Pi may already be joined).
+        if cfg.ssid:
+            from ecosys_pi.network import NetworkError, join_hotspot
+
+            try:
+                join_hotspot(cfg.ssid, cfg.password)
+            except NetworkError as exc:
+                _emit(out, f"error: {exc}")
+                return EXIT_ERROR
         try:
-            hub = resolve_hub(args.hub, environ=env)
+            hub = resolve_hub(args.hub, environ=env, port=cfg.hub_port)
         except HubNotFoundError as exc:
             _emit(out, f"error: {exc}")
             return EXIT_ERROR

@@ -1,9 +1,8 @@
-"""Tests for hub discovery: override -> env -> bounded mDNS, all hermetic.
+"""Tests for hub discovery: override -> env -> default gateway, all hermetic.
 
-No test opens a socket or touches a real hub: the zeroconf browser is injected
-with fakes, and the CLI seam is driven in-process with a stubbed resolver. The
-real :class:`HubServiceListener` logic is exercised against a fake Zeroconf, so
-the record-parsing path is covered without multicast.
+The hub is the phone hotspot's access point, so the hub address is the Pi's
+**default gateway**. No test runs ``nmcli``/``ip``: the gateway detector is
+injected with a deterministic stub, and the CLI seam is driven in-process.
 """
 
 from __future__ import annotations
@@ -13,207 +12,78 @@ import io
 import pytest
 
 from ecosys_pi import discovery
-from ecosys_pi.discovery import (
-    ENV_HUB,
-    SERVICE_TYPE,
-    HubNotFoundError,
-    HubServiceListener,
-    address_from_service_info,
-    browse_mdns,
-    resolve_hub,
-)
+from ecosys_pi.discovery import ENV_HUB, HubNotFoundError, resolve_hub
 
-TARGET = "10.0.0.5:50051"
+TARGET = "192.168.43.1:50051"
+GATEWAY = "192.168.43.1"
 
 
-class FakeServiceInfo:
-    """A minimal stand-in for a resolved ``zeroconf.ServiceInfo``."""
+def test_override_wins_without_touching_gateway() -> None:
+    """The explicit override is PRIMARY for automation and skips gateway probing."""
+    called: list[bool] = []
 
-    def __init__(self, addresses: list[str] | None, port: int) -> None:
-        self._addresses = addresses
-        self.port = port
-
-    def parsed_addresses(self) -> list[str]:
-        return list(self._addresses or [])
-
-
-class FakeZeroconf:
-    """Records ``get_service_info`` calls and returns a scripted record."""
-
-    def __init__(self, info: object = None) -> None:
-        self._info = info
-        self.calls: list[tuple[str, str, int]] = []
-        self.closed = False
-
-    def get_service_info(self, type_: str, name: str, timeout: int = 3000):
-        self.calls.append((type_, name, timeout))
-        return self._info
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class FakeBrowser:
-    """Fires one ``add_service`` synchronously, then is cancellable."""
-
-    def __init__(self, zc, type_, listener, name: str = f"hub.{SERVICE_TYPE}") -> None:
-        self.cancelled = False
-        listener.add_service(zc, type_, name)
-
-    def cancel(self) -> None:
-        self.cancelled = True
-
-
-def test_override_wins_without_touching_mdns() -> None:
-    """The explicit override is PRIMARY for automation and skips mDNS entirely."""
-    called: list[tuple[str, float]] = []
-
-    def explode(service_type: str, timeout: float) -> str | None:
-        called.append((service_type, timeout))
-        return "mdns-should-not-run:1"
+    def explode() -> str | None:
+        called.append(True)
+        return "gateway-should-not-run"
 
     result = resolve_hub(
         "127.0.0.1:1234",
         environ={ENV_HUB: TARGET},
-        resolve_mdns=explode,
+        detect_gateway=explode,
     )
+
     assert result == "127.0.0.1:1234"
-    assert called == [], "mDNS must not be browsed when an override is given"
+    assert called == [], "the gateway must not be probed when an override is given"
 
 
-def test_env_hub_wins_over_mdns() -> None:
-    """``PI_ECOSYS_HUB`` is the second precedence level and skips mDNS."""
-    called = []
+def test_env_hub_wins_over_gateway() -> None:
+    """``PI_ECOSYS_HUB`` is the second precedence level and skips the gateway."""
+    called: list[bool] = []
 
-    def explode(service_type: str, timeout: float) -> str | None:
-        called.append(service_type)
-        return "mdns:1"
+    def explode() -> str | None:
+        called.append(True)
+        return GATEWAY
 
-    assert resolve_hub(environ={ENV_HUB: TARGET}, resolve_mdns=explode) == TARGET
+    assert resolve_hub(environ={ENV_HUB: TARGET}, detect_gateway=explode) == TARGET
     assert called == []
 
 
 @pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
 def test_blank_override_and_env_are_treated_as_unset(blank: str) -> None:
-    """A blank override/env value falls through to mDNS (never returned as-is)."""
-    seen: list[str] = []
+    """A blank override/env value falls through to the gateway (never returned)."""
+    result = resolve_hub(
+        blank,
+        environ={ENV_HUB: blank},
+        detect_gateway=lambda: GATEWAY,
+    )
 
-    def stub(service_type: str, timeout: float) -> str | None:
-        seen.append(service_type)
-        return TARGET
-
-    assert resolve_hub(blank, environ={ENV_HUB: blank}, resolve_mdns=stub) == TARGET
-    assert seen == [SERVICE_TYPE]
-
-
-def test_mdns_result_is_returned_when_no_override() -> None:
-    """With no override/env, the injected mDNS result is returned verbatim."""
-    seen: list[tuple[str, float]] = []
-
-    def stub(service_type: str, timeout: float) -> str | None:
-        seen.append((service_type, timeout))
-        return TARGET
-
-    assert resolve_hub(environ={}, resolve_mdns=stub, timeout=1.5) == TARGET
-    assert seen == [(SERVICE_TYPE, 1.5)]
+    assert result == TARGET
 
 
-def test_no_service_timeout_raises_error_naming_env_hub() -> None:
-    """An mDNS miss raises a typed error whose message names ``PI_ECOSYS_HUB``."""
+def test_gateway_host_with_default_port() -> None:
+    """A detected default gateway yields ``gateway:50051`` by default."""
+    assert resolve_hub(environ={}, detect_gateway=lambda: GATEWAY) == TARGET
+
+
+def test_gateway_host_honours_a_configured_port() -> None:
+    """``hub_port`` (PI_ECOSYS_HUB_PORT) chooses the port on the gateway host."""
+    assert (
+        resolve_hub(environ={}, port=60061, detect_gateway=lambda: GATEWAY)
+        == "192.168.43.1:60061"
+    )
+
+
+def test_no_default_route_raises_error_naming_env_hub() -> None:
+    """With no override/env and no default route, the typed error plus escape hatch."""
     with pytest.raises(HubNotFoundError) as excinfo:
-        resolve_hub(environ={}, resolve_mdns=lambda *_: None, timeout=0.01)
+        resolve_hub(environ={}, detect_gateway=lambda: None)
+
     message = str(excinfo.value)
     assert ENV_HUB in message
-    assert SERVICE_TYPE in message
+    assert "--hub" in message
 
 
-def test_fake_zeroconf_browse_yields_expected_host_port() -> None:
-    """A fake browse resolves the first hub record to ``host:port``."""
-    zc = FakeZeroconf(FakeServiceInfo(["10.0.0.5"], 50051))
-    result = browse_mdns(
-        SERVICE_TYPE,
-        0.1,
-        zeroconf_factory=lambda: zc,
-        browser_factory=FakeBrowser,
-    )
-    assert result == TARGET
-    assert zc.calls and zc.calls[0][0] == SERVICE_TYPE
-    assert zc.closed is True, "the Zeroconf instance must always be closed"
-
-
-def test_browse_miss_returns_none_instead_of_raising() -> None:
-    """A record with no addresses is a miss (``None``), never an exception."""
-    zc = FakeZeroconf(FakeServiceInfo([], 50051))
-    assert (
-        browse_mdns(
-            SERVICE_TYPE,
-            0.1,
-            zeroconf_factory=lambda: zc,
-            browser_factory=FakeBrowser,
-        )
-        is None
-    )
-
-
-def test_broken_zeroconf_factory_is_a_miss() -> None:
-    """A host without a working multicast stack yields ``None``, not a crash."""
-
-    def boom():
-        raise OSError("no multicast here")
-
-    assert browse_mdns(SERVICE_TYPE, 0.1, zeroconf_factory=boom) is None
-
-
-def test_address_from_service_info_forms() -> None:
-    """IPv4 stays bare; IPv6 is bracketed; unusable records are ``None``."""
-    assert address_from_service_info(FakeServiceInfo(["192.168.43.1"], 50051)) == (
-        "192.168.43.1:50051"
-    )
-    assert address_from_service_info(FakeServiceInfo(["fe80::1"], 50051)) == (
-        "[fe80::1]:50051"
-    )
-    assert address_from_service_info(FakeServiceInfo([], 50051)) is None
-    assert address_from_service_info(FakeServiceInfo(["10.0.0.5"], 0)) is None
-    assert address_from_service_info(None) is None
-
-
-def test_listener_latches_only_the_first_address() -> None:
-    """Once latched, a later advertisement cannot overwrite the first answer."""
-    listener = HubServiceListener()
-    zc_one = FakeZeroconf(FakeServiceInfo(["10.0.0.5"], 50051))
-    zc_two = FakeZeroconf(FakeServiceInfo(["10.0.0.9"], 50052))
-
-    listener.add_service(zc_one, SERVICE_TYPE, "one")
-    listener.add_service(zc_two, SERVICE_TYPE, "two")
-
-    assert listener.address == TARGET
-    assert listener.wait(0.0) is True
-    assert zc_two.calls == [], "the second service must not be resolved"
-
-
-def test_listener_skips_unusable_record_and_keeps_waiting() -> None:
-    """An unusable record does not latch; a later good one does."""
-    listener = HubServiceListener()
-    listener.add_service(FakeZeroconf(FakeServiceInfo([], 1)), SERVICE_TYPE, "bad")
-    assert listener.address is None
-    assert listener.wait(0.0) is False
-
-    listener.add_service(
-        FakeZeroconf(FakeServiceInfo(["10.0.0.5"], 50051)), SERVICE_TYPE, "good"
-    )
-    assert listener.address == TARGET
-
-
-def test_listener_swallows_a_flaky_lookup() -> None:
-    """A ``get_service_info`` exception is a miss, not a crash."""
-
-    class RaisingZc:
-        def get_service_info(self, *args, **kwargs):
-            raise RuntimeError("record vanished")
-
-    listener = HubServiceListener()
-    listener.add_service(RaisingZc(), SERVICE_TYPE, "flaky")
-    assert listener.address is None
+# --- CLI seam: the frozen stdout/exit contract still holds --------------------
 
 
 def test_cli_seam_reports_discovery_failure_and_exits_one(monkeypatch) -> None:
@@ -253,7 +123,7 @@ def test_cli_seam_consults_discovery_when_no_hub_configured(
 
     calls: list[str | None] = []
 
-    def resolve(override, *, environ, timeout=discovery.DEFAULT_TIMEOUT_S):
+    def resolve(override, *, environ, port=50051):
         calls.append(override)
         return "127.0.0.1:1"
 

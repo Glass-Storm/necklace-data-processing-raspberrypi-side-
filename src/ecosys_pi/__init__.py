@@ -10,8 +10,9 @@ The subsystems are:
   its frozen stdout/exit contract.
 * :mod:`ecosys_pi.config` / :mod:`ecosys_pi.token_store` -- configuration and the
   ``0600`` token cache.
-* :mod:`ecosys_pi.discovery` -- hub resolution (explicit override, ``PI_ECOSYS_HUB``
-  env var, then bounded mDNS).
+* :mod:`ecosys_pi.discovery` / :mod:`ecosys_pi.network` -- hub resolution
+  (explicit override, ``PI_ECOSYS_HUB``, then the default gateway) and the
+  ``nmcli`` hotspot join.
 * :mod:`ecosys_pi.pairing` / :mod:`ecosys_pi.heartbeat` / :mod:`ecosys_pi.stream`
   -- the pairing, heartbeat, and bidirectional-stream clients.
 * :mod:`ecosys_pi.audio` / :mod:`ecosys_pi.camera` -- the mic and H.264 camera
