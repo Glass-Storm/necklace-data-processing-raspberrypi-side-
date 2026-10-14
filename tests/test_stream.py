@@ -33,6 +33,8 @@ from ecosys_pi.stream import (
 )
 
 TOKEN = "test-token-abc"
+#: The exact hub-synthesized PCM the fake hub ships in a ``tts_audio`` frame.
+TTS_PCM = bytes([42]) * 640
 
 #: Generous per-scenario timeout: a deadlock must fail, not hang.
 TIMEOUT = 30.0
@@ -58,10 +60,17 @@ class FakeHub(ecosys_pb2_grpc.StreamServiceServicer):
         reject_token: bool = False,
         stall_event: asyncio.Event | None = None,
         abort_calls: dict[int, grpc.StatusCode] | None = None,
+        emit_tts: bool = False,
+        emit_gesture: bool = False,
     ) -> None:
         self.transcript_on_audio = transcript_on_audio
         self.require_token = require_token
         self.reject_token = reject_token
+        # Hub-synthesized playback + gesture frames emitted once, on the first
+        # audio frame, so the receive path is exercised without any device.
+        self.emit_tts = emit_tts
+        self.emit_gesture = emit_gesture
+        self._extras_sent = False
         # When set, the hub reads NOTHING until it is released -- this is what
         # makes the client's write() hit transport backpressure.
         self.stall_event = stall_event
@@ -106,6 +115,18 @@ class FakeHub(ecosys_pb2_grpc.StreamServiceServicer):
                     yield ecosys_pb2.StreamFrame(
                         transcript=f"mock:{len(frame.audio_pcm16_16k)}"
                     )
+                if not self._extras_sent and frame.HasField("audio_pcm16_16k"):
+                    self._extras_sent = True
+                    if self.emit_tts:
+                        yield ecosys_pb2.StreamFrame(
+                            tts_audio=ecosys_pb2.TtsAudio(pcm16_16k=TTS_PCM, pts_ms=1)
+                        )
+                    if self.emit_gesture:
+                        yield ecosys_pb2.StreamFrame(
+                            gesture=ecosys_pb2.GestureResult(
+                                text="hello", label="Open_Palm", confidence=0.9
+                            )
+                        )
         finally:
             self.active_readers -= 1
             self.stream_ended = True
@@ -341,3 +362,109 @@ def test_send_after_close_is_refused() -> None:
             await client.send(_audio_frame(0))
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=TIMEOUT))
+
+
+async def _scenario_tts_and_gesture_dispatch() -> None:
+    hub = FakeHub(emit_tts=True, emit_gesture=True)
+    server, target = await _start_hub(hub)
+    channel = aio.insecure_channel(target)
+    played: list[bytes] = []
+    gestures: list[str] = []
+
+    try:
+        client = StreamClient(
+            channel,
+            TOKEN,
+            lambda _t: None,
+            on_tts_audio=played.append,
+            on_gesture=gestures.append,
+        )
+        run_task = asyncio.create_task(client.run())
+        await client.send(_audio_frame(0))
+
+        await _wait_until(lambda: len(played) == 1 and len(gestures) == 1)
+
+        client.close()
+        await asyncio.wait_for(run_task, timeout=TIMEOUT)
+
+        assert played == [TTS_PCM]
+        assert gestures == ["hello"]
+    finally:
+        await channel.close()
+        await _stop_hub(server)
+
+
+def test_tts_audio_and_gesture_frames_are_dispatched() -> None:
+    """A ``tts_audio`` frame reaches the player and a ``gesture`` frame the log."""
+    asyncio.run(asyncio.wait_for(_scenario_tts_and_gesture_dispatch(), timeout=TIMEOUT))
+
+
+async def _scenario_tts_without_callback_is_ignored() -> None:
+    hub = FakeHub(emit_tts=True, emit_gesture=True)
+    server, target = await _start_hub(hub)
+    channel = aio.insecure_channel(target)
+    transcripts: list[str] = []
+
+    try:
+        # No ``on_tts_audio`` / ``on_gesture``: the frames must be dropped
+        # silently, never raising into the reader.
+        client = StreamClient(channel, TOKEN, transcripts.append)
+        run_task = asyncio.create_task(client.run())
+        await client.send(_audio_frame(0))
+        await _wait_until(lambda: len(transcripts) == 1)
+
+        client.close()
+        await asyncio.wait_for(run_task, timeout=TIMEOUT)
+
+        assert transcripts == ["mock:640"]
+    finally:
+        await channel.close()
+        await _stop_hub(server)
+
+
+def test_tts_audio_without_a_callback_is_ignored() -> None:
+    """Unhandled hub frames must not break the reader."""
+    asyncio.run(
+        asyncio.wait_for(_scenario_tts_without_callback_is_ignored(), timeout=TIMEOUT)
+    )
+
+
+async def _scenario_all_payloads_reach_their_callbacks() -> None:
+    hub = FakeHub(emit_tts=True, emit_gesture=True)
+    server, target = await _start_hub(hub)
+    channel = aio.insecure_channel(target)
+    transcripts: list[str] = []
+    played: list[bytes] = []
+    gestures: list[str] = []
+
+    try:
+        client = StreamClient(
+            channel,
+            TOKEN,
+            transcripts.append,
+            on_tts_audio=played.append,
+            on_gesture=gestures.append,
+        )
+        run_task = asyncio.create_task(client.run())
+        await client.send(_audio_frame(0))
+
+        await _wait_until(lambda: bool(transcripts and played and gestures))
+
+        client.close()
+        await asyncio.wait_for(run_task, timeout=TIMEOUT)
+
+        assert transcripts == ["mock:640"]
+        assert played == [TTS_PCM]
+        assert gestures == ["hello"]
+    finally:
+        await channel.close()
+        await _stop_hub(server)
+
+
+def test_all_three_payloads_reach_their_callbacks() -> None:
+    """transcript, tts_audio and gesture dispatch without shadowing each other."""
+    asyncio.run(
+        asyncio.wait_for(
+            _scenario_all_payloads_reach_their_callbacks(), timeout=TIMEOUT
+        )
+    )

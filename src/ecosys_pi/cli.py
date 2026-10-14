@@ -1,4 +1,4 @@
-"""The runnable Pi client: config -> pair -> heartbeat -> stream -> media/TTS.
+"""The runnable Pi client: config -> pair -> heartbeat -> stream -> media/playback.
 
 ``python -m ecosys_pi`` is the single entry point task 14's JVM E2E harness
 drives. Its **stdout is a frozen contract** (see :data:`STDOUT_CONTRACT`): the
@@ -93,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ecosys-pi",
         description=(
             "Pair with the phone-manager hub and stream camera/microphone media "
-            "with local TTS playback."
+            "with hub-synthesized audio playback."
         ),
     )
     parser.add_argument(
@@ -237,15 +237,11 @@ def _dispatch(
             channel.close()
         _emit(out, f"pair-ok device={credentials.device_id}")
 
-    session_config = Config(
-        hub=hub, pin=pin, tts_lang=lang, device_name=cfg.device_name
-    )
     try:
         return asyncio.run(
             _run_session(
                 hub,
                 credentials,
-                session_config,
                 mode=args.mode,
                 frames=args.frames,
                 env=env,
@@ -261,7 +257,6 @@ def _dispatch(
 async def _run_session(
     hub: str,
     credentials: Credentials,
-    cfg: Config,
     *,
     mode: str,
     frames: int,
@@ -281,31 +276,45 @@ async def _run_session(
     from ecosys_pi.camera import select_video_source
     from ecosys_pi.heartbeat import HeartbeatClient, UnauthenticatedError
     from ecosys_pi.stream import StreamClient, StreamTransportError
-    from ecosys_pi.tts import build_speaker
+    from ecosys_pi.tts import build_player
 
     max_frames = frames if frames > 0 else None
     audio_enabled = mode in ("audio", "both")
     video_enabled = mode in ("video", "both")
     received = 0
 
-    # ONE gate is shared by the capture source and the TTS speaker, so audio is
-    # muted for exactly the duration of an utterance (half-duplex).
+    # ONE gate is shared by the capture source and the player, so capture is
+    # muted for exactly the duration of hub-synthesized playback (half-duplex).
     gate = HalfDuplexGate()
-    speaker = build_speaker(cfg.tts_lang, environ=env, gate=gate)
+    player = build_player(env, gate=gate)
 
     async def on_transcript(text: str) -> None:
         nonlocal received
         received += 1
         _emit(out, f"transcript {text}")
-        # Blocking subprocess playback runs off-loop; the speaker toggles the
+
+    async def on_tts_audio(pcm: bytes) -> None:
+        # Blocking subprocess playback runs off-loop; the player toggles the
         # shared gate itself and always clears it, even on failure.
-        await asyncio.to_thread(speaker.speak, text)
+        await asyncio.to_thread(player.play, pcm)
+
+    async def on_gesture(text: str) -> None:
+        # A gesture frame is informational here: the hub speaks the meaning via
+        # tts_audio, so surface the text without touching the frozen stdout.
+        _LOG.info("gesture frame received: %s", text)
+        print(f"[Pi Gesture] {text}", file=err)
 
     channel = aio.insecure_channel(hub)
     announce: asyncio.Task[None] | None = None
     tasks: list[asyncio.Task[Any]] = []
     try:
-        client = StreamClient(channel, credentials.token, on_transcript)
+        client = StreamClient(
+            channel,
+            credentials.token,
+            on_transcript,
+            on_tts_audio=on_tts_audio,
+            on_gesture=on_gesture,
+        )
         heartbeat = HeartbeatClient(channel, credentials.token, credentials.device_id)
 
         stream_task = asyncio.create_task(client.run(), name="ecosys-cli-stream")

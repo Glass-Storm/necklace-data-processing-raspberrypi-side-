@@ -2,7 +2,7 @@
 
 This package is the Pi-side client that pairs with the phone-manager hub over
 gRPC, holds an authenticated heartbeat, and streams microphone and camera media
-on one bidirectional stream while playing returned transcripts back locally.
+on one bidirectional stream while playing the audio the hub sends back.
 
 The subsystems are:
 
@@ -16,10 +16,10 @@ The subsystems are:
   -- the pairing, heartbeat, and bidirectional-stream clients.
 * :mod:`ecosys_pi.audio` / :mod:`ecosys_pi.camera` -- the mic and H.264 camera
   sources plus the paced audio producer.
-* :mod:`ecosys_pi.tts` -- language-selected local text-to-speech playback.
+* :mod:`ecosys_pi.tts` -- playback of hub-synthesized speech (PCM16 @ 16 kHz).
 
-Hardware-backed capture and playback (picamera2, PortAudio, espeak-ng, piper)
-are optional: every module imports and runs without them and falls back to
+Hardware-backed capture and playback (picamera2, PortAudio, ALSA ``aplay``) are
+optional: every module imports and runs without them and falls back to
 deterministic synthetic sources.
 """
 

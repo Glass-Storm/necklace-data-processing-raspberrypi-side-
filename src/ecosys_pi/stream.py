@@ -11,8 +11,10 @@ stream-stream call:
   audio queue PARKS), the writer stalls on ``write()``, the queue fills, and
   :meth:`StreamClient.send` blocks the media producer instead of buffering
   without limit.
-* a READER ``read()``s ``StreamFrame``s and dispatches every ``transcript`` to
-  the caller's callback.
+* a READER ``read()``s ``StreamFrame``s and dispatches each payload variant to
+  the caller's callback: a ``transcript`` and a ``gesture`` are text, while a
+  ``tts_audio`` carries the hub-synthesized PCM the necklace plays. A frame whose
+  callback is unset is dropped silently, never raised into the reader.
 
 Hard rules (frozen protocol):
 
@@ -33,7 +35,7 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Final
+from typing import Any, Final
 
 import grpc
 from grpc import aio
@@ -58,6 +60,10 @@ AUTHORIZATION_HEADER: Final = "authorization"
 _SHUTDOWN: Final = object()
 
 TranscriptCallback = Callable[[str], Awaitable[None] | None]
+#: A ``tts_audio`` frame's raw PCM16 @ 16 kHz bytes handed to the player.
+TtsAudioCallback = Callable[[bytes], Awaitable[None] | None]
+#: A ``gesture`` frame's recognized text handed to the log.
+GestureCallback = Callable[[str], Awaitable[None] | None]
 
 
 class StreamError(Exception):
@@ -95,6 +101,8 @@ class StreamClient:
         token: str,
         on_transcript: TranscriptCallback,
         *,
+        on_tts_audio: TtsAudioCallback | None = None,
+        on_gesture: GestureCallback | None = None,
         queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
         max_reconnects: int = DEFAULT_MAX_RECONNECTS,
         reconnect_backoff: float = DEFAULT_RECONNECT_BACKOFF,
@@ -110,6 +118,9 @@ class StreamClient:
         # reconnects with THIS token; only UNAUTHENTICATED asks for a re-pair.
         self._token = token
         self._on_transcript = on_transcript
+        # Optional per-payload callbacks: an unset one simply drops its frame.
+        self._on_tts_audio = on_tts_audio
+        self._on_gesture = on_gesture
         self._queue: asyncio.Queue[object] = asyncio.Queue(maxsize=queue_maxsize)
         self._shutdown = asyncio.Event()
         self._max_reconnects = max_reconnects
@@ -291,9 +302,16 @@ class StreamClient:
                 raise _classify(exc) from exc
             if response is aio.EOF:
                 return
-            text = response.transcript
-            if text:
-                await _dispatch(self._on_transcript, text)
+            payload = response.WhichOneof("payload")
+            if payload == "transcript" and response.transcript:
+                await _dispatch(self._on_transcript, response.transcript)
+            elif payload == "tts_audio" and self._on_tts_audio is not None:
+                pcm = response.tts_audio.pcm16_16k
+                if pcm:
+                    await _dispatch(self._on_tts_audio, pcm)
+            elif payload == "gesture" and self._on_gesture is not None:
+                if response.gesture.text:
+                    await _dispatch(self._on_gesture, response.gesture.text)
 
 
 def _classify(exc: aio.AioRpcError) -> StreamError:
@@ -305,8 +323,10 @@ def _classify(exc: aio.AioRpcError) -> StreamError:
     return StreamTransportError(f"{exc.code().name}: {exc.details()}")
 
 
-async def _dispatch(callback: TranscriptCallback, text: str) -> None:
-    """Invoke the transcript callback, awaiting it when it is a coroutine."""
-    result = callback(text)
+async def _dispatch(
+    callback: Callable[[Any], Awaitable[None] | None], value: Any
+) -> None:
+    """Invoke a receive callback, awaiting it when it is a coroutine."""
+    result = callback(value)
     if inspect.isawaitable(result):
         await result
