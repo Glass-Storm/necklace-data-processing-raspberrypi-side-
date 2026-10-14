@@ -1,9 +1,10 @@
 # ecosys-pi
 
-The Raspberry Pi peer for the `ecosys.v1` device ecosystem. It **pairs with the
-`phone-manager` hub over gRPC**, streams camera (H.264) and microphone (PCM16)
-media, receives transcripts on the same bidi stream, and speaks them back through
-a language-selected local TTS engine.
+The Raspberry Pi peer for the `ecosys.v1` device ecosystem. It joins the phone's
+hotspot by hand, opens an **UNAUTHENTICATED** gRPC stream to the `phone-manager`
+hub, streams **JPEG stills** (320×240) and microphone (PCM16) media, and plays
+the audio the hub synthesizes. It no longer pairs, heartbeats, or synthesizes
+speech locally.
 
 This is the client that replaced the old raw TCP/JSON node. `python -m ecosys_pi`
 is the single entry point; the hub-driven end-to-end harness in `phone-manager`
@@ -18,17 +19,20 @@ drives exactly this CLI.
 
 ## How it talks to the hub
 
-The hub is a gRPC server (`ecosys.v1.PairingService` + `ecosys.v1.StreamService`)
-and is the **access point**; the Pi is a **DHCP client** that joins the hotspot.
+The hub is a gRPC server (`ecosys.v1.StreamService`) and is the **access point**;
+the Pi is a **DHCP client** that joins the hotspot.
 
-1. **Pair** — one single-use 6-digit PIN (120 s TTL, 5 attempts) exchanged for a
-   bearer token. The token is cached at `0600` outside the repo
-   (`$XDG_CONFIG_HOME/ecosys-pi/credentials.json`, default `~/.config/...`).
-2. **Heartbeat** — a background `Heartbeat` keeps the paired session alive and
-   independently detects a revoked token (`UNAUTHENTICATED` → re-pair).
-3. **Stream** — one authenticated bidirectional `OpenStream`: the Pi pushes
-   `audio_pcm16_16k` (640-byte, 20 ms frames) and/or `video_h264_nal` frames; the
-   hub pushes `transcript` frames back, which the Pi speaks.
+1. **Join + discover** — the Pi joins the hotspot from its config with `nmcli`
+   (SSID + WPA2/WPA3 password), then resolves the hub as the **default gateway**
+   (`ip route`, falling back to `nmcli`). There is no PIN, no token, no heartbeat
+   and no mDNS; `--hub` / `PI_ECOSYS_HUB` override the gateway.
+2. **Stream** — one UNAUTHENTICATED `OpenStream`: the Pi opens it with a
+   `stream_open` frame that binds its device id/role, then pushes `image`
+   (320×240 JPEG stills at ~10 fps) and/or `audio_pcm16_16k` (640-byte, 20 ms
+   frames) frames. The hub sends back `gesture` text and `tts_audio` (PCM16 @
+   16 kHz), which the Pi plays; a legacy `transcript` frame is logged to stdout.
+3. **No heartbeat** — liveness is implied by the open stream; a transport loss
+   simply reconnects.
 
 The wire contract is **frozen**: [`proto/ecosys/v1/ecosys.proto`](proto/ecosys/v1/ecosys.proto)
 is a byte-identical copy of the hub's proto. See [`docs/PROTOCOL_DECISIONS.md`](docs/PROTOCOL_DECISIONS.md)
@@ -73,10 +77,7 @@ this flag, so a venv built without it fails the suite.
 # Camera (picamera2) — Debian-packaged libcamera bindings.
 sudo apt install -y python3-picamera2
 
-# Cantonese TTS (yue) + Piper phonemisation data.
-sudo apt install -y espeak-ng espeak-ng-data
-
-# Optional: ALSA capture fallback + Piper playback.
+# ALSA playback (aplay) for hub-synthesized audio; libportaudio2 is the fallback.
 sudo apt install -y alsa-utils libportaudio2
 ```
 
@@ -92,25 +93,13 @@ uv sync --extra pi
 > (`sudo apt install -y libcap-dev`) because `picamera2` pulls in
 > `python-prctl`, whose build backend needs `libcap` development headers.
 
-### Piper voices (zh / en)
+### Audio playback
 
-`piper-tts` is a normal `uv` dependency (`uv add piper-tts`, already in the
-lockfile). Its voice models are **not** bundled and `piper` is archived, so the
-exact model files are pinned by URL in `src/ecosys_pi/tts.py`
-(`PIPER_VOICE_URLS`). Download both the `.onnx` and the `.onnx.json` for each
-language you need into `$PI_ECOSYS_PIPER_DATA_DIR`
-(default `~/.local/share/piper-voices`):
-
-- `zh` (Mandarin, `zh_CN-huayan-medium`):
-  - https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx
-  - https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json
-- `en` (English, `en_US-lessac-medium`):
-  - https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
-  - https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
-
-`yue` (Cantonese) uses `espeak-ng` instead — Piper has no Cantonese voice. When
-an engine or voice is missing the client **warns and keeps streaming**; it never
-crashes the session.
+The Pi does **not** synthesize speech: the hub runs text-to-speech and ships raw
+PCM16 mono @ 16 kHz. The Pi plays those bytes with
+`aplay -f S16_LE -r 16000 -c 1` (`alsa-utils`), falling back to
+`sounddevice`/PortAudio (`libportaudio2`). When neither backend is present the
+client **warns and keeps streaming**; it never crashes the session.
 
 ## Commands
 
@@ -124,72 +113,65 @@ uv run python -m ecosys_pi --help         # the CLI
 ### Running the client
 
 ```bash
-# Pair interactively (the PIN is read from the console) and stream both media.
+# Join the hotspot from config (SSID/password) and stream both media to the
+# gateway hub.
 uv run python -m ecosys_pi
 
-# Scripted: explicit hub + PIN, audio only, 100 frames, English TTS.
-PI_ECOSYS_TTS_LANG=en uv run python -m ecosys_pi \
-    --hub 192.168.43.1:50051 --pin 482915 --mode audio --frames 100
-
-# Find the hub by mDNS `_ecosys._tcp` (no --hub, no PI_ECOSYS_HUB).
-uv run python -m ecosys_pi
+# Scripted: explicit hub, audio only, 100 frames.
+uv run python -m ecosys_pi --hub 192.168.43.1:50051 --mode audio --frames 100
 ```
 
 ### CLI flags
 
-| Flag                        | Default | Meaning                                                               |
-| --------------------------- | ------- | --------------------------------------------------------------------- |
-| `--hub HOST:PORT`           | (unset) | Hub address, overriding `PI_ECOSYS_HUB` and mDNS discovery.           |
-| `--pin PIN`                 | (unset) | Pairing PIN, overriding the console. Forces ONE non-interactive Pair. |
-| `--mode audio\|video\|both` | `both`  | Which media to stream.                                                |
-| `--frames N`                | `0`     | Frames per medium; `0` runs until interrupted.                        |
-| `--no-cache`                | `false` | Ignore the cached token and force a fresh Pair.                       |
-| `--lang yue\|zh\|en`        | (unset) | TTS language, overriding `PI_ECOSYS_TTS_LANG`.                        |
+| Flag                        | Default | Meaning                                                  |
+| --------------------------- | ------- | -------------------------------------------------------- |
+| `--hub HOST:PORT`           | (unset) | Hub address, overriding `PI_ECOSYS_HUB` and the gateway. |
+| `--mode audio\|video\|both` | `both`  | Which media to stream.                                   |
+| `--frames N`                | `0`     | Frames per medium; `0` runs until interrupted.           |
+| `--lang yue\|zh\|en`        | (unset) | Retained for compatibility; the hub selects the voice.   |
 
 ### stdout / exit contract (frozen)
 
 Automation (including the hub's JVM E2E harness) keys on stdout, so these lines
-are frozen. Informational chatter from the media/TTS modules goes to **stderr**.
+are frozen. Informational chatter from the media/playback modules goes to
+**stderr**.
 
-| Line                       | Meaning                                          | Exit |
-| -------------------------- | ------------------------------------------------ | ---- |
-| `pair-ok device=<id>`      | Pair succeeded.                                  | 0    |
-| `heartbeat-ok`             | The first heartbeat was accepted.                | 0    |
-| `transcript <text>`        | One transcript frame received from the hub.      | 0    |
-| `pair-rejected reason=<r>` | The hub refused the PIN (typed reason verbatim). | 2    |
-| `re-pair-requested`        | The token was refused (`UNAUTHENTICATED`).       | 2    |
-| `error: <detail>`          | Anything else.                                   | 1    |
+| Line                | Meaning                               | Exit |
+| ------------------- | ------------------------------------- | ---- |
+| `transcript <text>` | One legacy transcript frame received. | 0    |
+| `error: <detail>`   | Anything else.                        | 1    |
 
 ## Environment variables
 
-| Variable                   | Default                       | Meaning                                                                                                    |
-| -------------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `PI_ECOSYS_HUB`            | (unset)                       | `HOST:PORT` hub override. Precedence: `--hub` > `PI_ECOSYS_HUB` > mDNS. A blank value is treated as unset. |
-| `PI_ECOSYS_PIN`            | (unset)                       | **Scripting only.** Single-use PIN with a 120 s TTL — not durable config.                                  |
-| `PI_ECOSYS_TTS_LANG`       | `yue`                         | One of `yue` / `zh` / `en`. Blank or unknown falls back to `yue`.                                          |
-| `PI_ECOSYS_DEVICE_NAME`    | `socket.gethostname()`        | Non-blank label sent to the hub; blank falls back to the hostname, then `ecosys-pi`.                       |
-| `PI_ECOSYS_PIPER_DATA_DIR` | `~/.local/share/piper-voices` | Where Piper looks for voice models.                                                                        |
-| `PI_ECOSYS_AUDIO_SOURCE`   | `auto`                        | `auto` / `synthetic` / `sounddevice` / `arecord`. `synthetic` is deterministic (used by tests).            |
-| `PI_ECOSYS_VIDEO_SOURCE`   | `auto`                        | `auto` / `synthetic` / `picamera2`. `picamera2` when absent falls back to `synthetic`.                     |
+| Variable                       | Default                | Meaning                                                                                           |
+| ------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------- |
+| `PI_ECOSYS_HUB`                | (unset)                | `HOST:PORT` hub override. Precedence: `--hub` > `PI_ECOSYS_HUB` > default gateway. Blank = unset. |
+| `PI_ECOSYS_SSID`               | (unset)                | Hotspot SSID the Pi joins with `nmcli`.                                                           |
+| `PI_ECOSYS_HOTSPOT_PASSWORD`   | (unset)                | Hotspot WPA2/WPA3 password. A secret: redacted in `Config.__repr__`.                              |
+| `PI_ECOSYS_HUB_PORT`           | `50051`                | Hub gRPC port appended to the gateway host.                                                       |
+| `PI_ECOSYS_ENROLLMENT_SECONDS` | `8`                    | Voiceprint enrollment length (informational on the Pi).                                           |
+| `PI_ECOSYS_TTS_LANG`           | `yue`                  | Retained for compatibility; has no effect on the wire (the hub selects the voice).                |
+| `PI_ECOSYS_DEVICE_NAME`        | `socket.gethostname()` | Label sent in the `stream_open` frame; blank falls back to the hostname, then `ecosys-pi`.        |
+| `PI_ECOSYS_AUDIO_SOURCE`       | `auto`                 | `auto` / `synthetic` / `sounddevice` / `arecord`. `synthetic` is deterministic (used by tests).   |
+| `PI_ECOSYS_VIDEO_SOURCE`       | `auto`                 | `auto` / `synthetic` / `picamera2`. `picamera2` when absent falls back to `synthetic`.            |
 
 > **systemd caveat.** The client reads the _process_ environment. A unit started
 > for a service user gets a fresh, minimal environment — set variables with
-> `Environment=` / `EnvironmentFile=` in the unit, and give the user an
-> `XDG_CONFIG_HOME` it owns at mode `0700` so the token cache lands somewhere
-> writable.
+> `Environment=` / `EnvironmentFile=` in the unit, or point the loader at a
+> `.env` / `config.json` file, or the defaults apply.
 
 ## Scope: what this branch does NOT do
 
-- **BLE Wi-Fi provisioning is OUT OF SCOPE for this branch.** The BLE Wi-Fi
-  helper (a script that pushed Wi-Fi credentials via `nmcli`) is **not** part of
-  the `ecosys` client and has been parked under [`legacy/`](legacy/README.md).
-  In this topology the **hub is the access point** and the Pi is a **DHCP
-  client**; the Pi never receives Wi-Fi credentials over BLE. Do not wire BLE
-  back into the client.
-- **Glass display (glass↔hub fan-out) is OUT OF SCOPE.** <!-- TODO(glass-display): the hub currently DISCARDS all video (`DiscardingFrameSink`); a glasses app that consumes the H.264 stream is future work and is intentionally not built here. -->
-- Sign-language recognition, speaker diarization, and real (non-mock)
-  transcription are out of scope; the hub's default engine emits a deterministic
-  mock transcript.
+- **No BLE and no programmatic Wi-Fi.** The BLE provisioning helper is parked
+  under [`legacy/`](legacy/README.md) and is NOT imported. The Pi joins the
+  hotspot from config with `nmcli` and finds the hub at the **default gateway**;
+  there is no mDNS and no BLE.
+- **The Pi does not synthesize speech.** The hub runs TTS and ships PCM16 @
+  16 kHz; the Pi only plays it.
+- **The Pi does not run gesture recognition or diarization.** It sends JPEG
+  stills and mic audio; the hub decodes the stills, recognizes the gesture, runs
+  the speech/diarization engine, and fans the results out to the glasses and the
+  necklace.
 
 ## Adding a dependency
 

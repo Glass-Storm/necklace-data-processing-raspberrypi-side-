@@ -3,65 +3,90 @@
 These are the wire-contract and hub-behaviour facts the Pi client is built
 against. They are FROZEN: the Pi vendors the proto byte-identically
 (`proto/ecosys/v1/ecosys.proto`, sha256
-`a09d830989898908cd4073c52658acff7aa0302f10f254576618bf27662d7c3b`) and MUST NOT
+`56cdbf19dad7669876a5b5899e4821bf42a328e53c1f8684cd82424d1941d2c2`) and MUST NOT
 change the contract locally.
 
 Provenance of the contract: see `proto/PROTO_SOURCE` (hub repo `phone-manager`,
-`contract/src/main/proto/ecosys/v1/ecosys.proto`, source commit `0d454ce`).
+`contract/src/main/proto/ecosys/v1/ecosys.proto`, source commit `50d77e8`).
 Drift is detected by `tests/test_proto_drift.py`, which re-hashes the proto in
 the sibling hub checkout.
 
-## (a) The stream is LONG-LIVED
+## (a) The stream is UNAUTHENTICATED, and the session binds with `stream_open`
 
-`StreamService/OpenStream` is a bidirectional stream that stays open for the
-whole session. **The Pi does NOT call `done_writing()` until shutdown.** The Pi
-keeps sending audio/video frames and reads hub frames concurrently; transcripts
-from the hub are expected and consumed _while the Pi is still sending_. A peer
-that half-closes after its first request is wrong.
+`StreamService/OpenStream` is a bidirectional stream opened with **no token**.
+Pairing, PIN and bearer tokens were **removed from the hub runtime**, so the Pi
+never calls `Pair` and never sends an `authorization` header. Instead the FIRST
+frame on the stream is a `stream_open` (`StreamOpenRequest{device_id, kind,
+role}`) that binds the session; the hub routes frames by the bound role.
 
-## (b) One `transcript` per 20 ms audio chunk; mock text for the default engine
+`PairingService`/`Pair`/`Heartbeat` remain declared in the frozen `.proto` as an
+unserved, reserved stub (wire compatibility) — the Pi must not call them.
 
-The hub emits exactly **one `transcript` frame per 20 ms audio chunk** it
-receives. Under the hub's default (mock) recogniser the text is:
+## (b) The stream is LONG-LIVED
 
-```
-mock:<len>:<fnv1a64>
-```
+The bidi stream stays open for the whole session. **The Pi does NOT call
+`done_writing()` until shutdown.** It keeps sending image/audio frames and reads
+hub frames concurrently. A peer that half-closes after its first request is
+wrong.
 
-where `<len>` is the byte length of the chunk and `<fnv1a64>` is the FNV-1a
-64-bit hash of the chunk bytes rendered in hex. This is a **plumbing proof, not
-recognition** — it demonstrates the audio path end-to-end without a real ASR
-engine. Tests may rely on the deterministic `mock:<len>:<hash>` value for a
-known input frame.
+## (c) The Pi sends JPEG stills, NOT H.264
 
-## (c) The hub NEVER emits `result` frames
+The video producer sends `StreamFrame.image` (`ImageFrame{jpeg, pts_ms, width,
+height}`) at **320×240 and ~10 fps** (a 0.1 s pump cadence). It does **not** send
+`video_h264_nal`. This is the ONE media kind the hub decodes — into a bitmap,
+solely to run isolated gesture recognition. The hub never re-encodes, stores, or
+renders it.
 
-The `result` variant of `StreamFrame.payload` (`StreamResult`) is never sent by
-the hub. Therefore `pts_ms` and `speaker_label` are **always empty/zero** from
-the hub — `StreamResult` is part of the frozen contract but unused on this wire.
-The Pi must not block on result frames.
+## (d) Hub-synthesized TTS: the Pi only plays
 
-## (d) `DeviceRole` is stored but never enforced
+The hub runs text-to-speech and sends `StreamFrame.tts_audio`
+(`TtsAudio.pcm16_16k`, raw little-endian PCM16 mono **@ 16 kHz**). The Pi **only
+plays those bytes** — via `aplay -f S16_LE -r 16000 -c 1`, falling back to
+`sounddevice` — and never synthesizes speech locally. A `gesture` frame is
+informational: the spoken meaning arrives as `tts_audio`.
 
-The hub persists the role from `PairRequest.role` but performs **no enforcement**
-based on it. This client uses `DEVICE_ROLE_DAEMON` (enum value `2`), matching the
-Ubuntu-daemon peer role; the value is informational only.
+## (e) Hub frames the Pi consumes
 
-## (e) There is NO language field in the contract
+The Pi's reader dispatches exactly three hub payload variants:
 
-The frozen proto carries no language/locale field on any message. Therefore
-`PI_ECOSYS_TTS_LANG` affects **only local TTS** playback on the Pi; it is never
-transmitted to the hub and has no effect on the hub or the recogniser.
+- `tts_audio` — played (section d).
+- `gesture` — its recognized text is logged to **stderr** (never the frozen
+  stdout contract).
+- `transcript` — the legacy plain-text form; printed as the frozen
+  `transcript <text>` stdout line.
 
-## (f) Real-hub acceptance evidence
+`result` / `enroll_request` / `enroll_response` / `stream_open` are
+glasses-facing (or peer-to-hub) frames the necklace does not consume.
 
-Acceptance against a real hub is proven by the exact stdout lines the client
-prints — `pair-ok device=<id>` and the per-chunk `transcript <text>` lines —
-**plus a deterministic `mock:<len>:<hash>` value for a known input frame**. The
-deterministic mock value is what makes the end-to-end audio path verifiable.
+## (f) Hub discovery: `nmcli` hotspot join, then the default gateway
 
-## (g) The Pi caps its own frame size; the hub's 4 MiB limit is never hit
+The hub is the phone hotspot's access point, so the Pi:
+
+1. joins the hotspot from config with
+   `nmcli device wifi connect <ssid> password <pw>` (WPA2, or WPA3 personal with
+   `wifi-sec.key-mgmt sae`), then
+2. resolves the hub as the **default gateway** (`ip route`, falling back to
+   `nmcli --terse --fields IP4.GATEWAY device show`) and appends the hub port.
+
+There is **NO mDNS**: the precedence is `--hub` > `PI_ECOSYS_HUB` > default
+gateway. When no gateway exists the client raises `HubNotFoundError` with a
+clear message rather than hanging. Credentials come from the git-ignored
+dotenv/config layer; nothing is hardcoded.
+
+## (g) No heartbeat; liveness is implied by the open stream
+
+The Pi **does not heartbeat**. The hub no longer serves `Heartbeat`, and liveness
+is implied by the open `OpenStream`; a transport loss simply reconnects.
+
+## (h) No language field; no local synthesis
+
+The frozen proto carries no language/locale field. The Pi's `--lang` /
+`PI_ECOSYS_TTS_LANG` setting therefore has **no effect on the wire** and no local
+TTS engine to drive: the hub selects the voice and ships the audio. The setting
+is retained for compatibility only.
+
+## (i) The Pi caps its own frame size; the hub's 4 MiB limit is never hit
 
 The hub's default gRPC inbound message limit is **4 MiB**. The Pi caps its own
-frame size (chunking audio/video) so a single frame is always well under that
-bound. **No hub change is needed.**
+frame size (chunking audio, one JPEG per frame) so a single frame is always well
+under that bound. **No hub change is needed.**
