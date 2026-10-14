@@ -157,14 +157,16 @@ message StreamFrame {
   }
 }
 
-// Pairing + liveness. Pair is the ONE rpc allowed without a bearer token
-// (and only while a pairing window is open). Heartbeat requires a token.
+// Pairing + liveness stubs. FROZEN and UNSERVED: the hub runtime serves neither
+// rpc (auth and PIN pairing were removed from the runtime in v3). Both stay only
+// for wire compatibility and must never be re-wired into the runtime.
 service PairingService {
   rpc Pair(PairRequest) returns (PairResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
-// Bidirectional media + results relay. Every rpc here requires a token.
+// Bidirectional media + results relay. OpenStream is UNAUTHENTICATED: a peer binds
+// its identity by sending a stream_open frame on the stream itself.
 service StreamService {
   rpc OpenStream(stream StreamFrame) returns (stream StreamFrame);
 }

@@ -26,8 +26,9 @@ if _version_not_supported:
 
 
 class PairingServiceStub:
-    """Pairing + liveness. Pair is the ONE rpc allowed without a bearer token
-    (and only while a pairing window is open). Heartbeat requires a token.
+    """Pairing + liveness stubs. FROZEN and UNSERVED: the hub runtime serves neither
+    rpc (auth and PIN pairing were removed from the runtime in v3). Both stay only
+    for wire compatibility and must never be re-wired into the runtime.
     """
 
     def __init__(self, channel):
@@ -49,8 +50,9 @@ class PairingServiceStub:
 
 
 class PairingServiceServicer:
-    """Pairing + liveness. Pair is the ONE rpc allowed without a bearer token
-    (and only while a pairing window is open). Heartbeat requires a token.
+    """Pairing + liveness stubs. FROZEN and UNSERVED: the hub runtime serves neither
+    rpc (auth and PIN pairing were removed from the runtime in v3). Both stay only
+    for wire compatibility and must never be re-wired into the runtime.
     """
 
     def Pair(self, request, context):
@@ -87,8 +89,9 @@ def add_PairingServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class PairingService:
-    """Pairing + liveness. Pair is the ONE rpc allowed without a bearer token
-    (and only while a pairing window is open). Heartbeat requires a token.
+    """Pairing + liveness stubs. FROZEN and UNSERVED: the hub runtime serves neither
+    rpc (auth and PIN pairing were removed from the runtime in v3). Both stay only
+    for wire compatibility and must never be re-wired into the runtime.
     """
 
     @staticmethod
@@ -147,7 +150,8 @@ class PairingService:
 
 
 class StreamServiceStub:
-    """Bidirectional media + results relay. Every rpc here requires a token.
+    """Bidirectional media + results relay. OpenStream is UNAUTHENTICATED: a peer binds
+    its identity by sending a stream_open frame on the stream itself.
     """
 
     def __init__(self, channel):
@@ -164,7 +168,8 @@ class StreamServiceStub:
 
 
 class StreamServiceServicer:
-    """Bidirectional media + results relay. Every rpc here requires a token.
+    """Bidirectional media + results relay. OpenStream is UNAUTHENTICATED: a peer binds
+    its identity by sending a stream_open frame on the stream itself.
     """
 
     def OpenStream(self, request_iterator, context):
@@ -190,7 +195,8 @@ def add_StreamServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class StreamService:
-    """Bidirectional media + results relay. Every rpc here requires a token.
+    """Bidirectional media + results relay. OpenStream is UNAUTHENTICATED: a peer binds
+    its identity by sending a stream_open frame on the stream itself.
     """
 
     @staticmethod
