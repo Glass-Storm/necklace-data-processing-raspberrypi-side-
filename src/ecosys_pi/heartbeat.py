@@ -89,8 +89,8 @@ class HeartbeatClient:
     def __init__(
         self,
         channel: aio.Channel,
-        token: str,
-        device_id: str,
+        token: str | None = None,
+        device_id: str = "",
         *,
         interval: float = DEFAULT_INTERVAL_S,
         timeout: float = DEFAULT_CALL_TIMEOUT_S,
@@ -101,8 +101,8 @@ class HeartbeatClient:
         backoff_sleep: Sleeper | None = None,
         max_beats: int | None = None,
     ) -> None:
-        if not token:
-            raise ValueError("token must be non-empty; pair before beating")
+        if token is not None and not token:
+            raise ValueError("token must be a non-empty string or None")
         if not device_id:
             raise ValueError("device_id must be non-empty; it is the request field")
         if interval <= 0:
@@ -212,7 +212,11 @@ class HeartbeatClient:
         """
         stub = ecosys_pb2_grpc.PairingServiceStub(self._channel)
         request = ecosys_pb2.HeartbeatRequest(device_id=self._device_id)
-        metadata = ((AUTHORIZATION_HEADER, f"Bearer {self._token}"),)
+        metadata = (
+            ((AUTHORIZATION_HEADER, f"Bearer {self._token}"),)
+            if self._token is not None
+            else None
+        )
 
         attempt = 0
         while True:

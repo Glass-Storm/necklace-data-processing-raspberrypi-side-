@@ -7,13 +7,11 @@ task-14 E2E harness will observe: the process stdout and exit code.
 
 Coverage:
 
-* ``--help`` lists every frozen flag;
-* a happy path prints ``pair-ok`` / ``heartbeat-ok`` / ``transcript ...`` and
-  exits ``0``;
-* a refused PIN prints ``pair-rejected reason=<r>`` and exits ``2`` in exactly
-  ONE Pair attempt (non-interactive);
-* ``--no-cache`` forces a fresh Pair (and a usable cache skips it);
-* a non-TTY run with no PIN fails fast with ``error:`` on stdout, never hangs.
+* ``--help`` lists every runtime flag (and no pairing flag);
+* a happy path opens the stream UNAUTHENTICATED (no bearer token, no pairing)
+  and prints ``heartbeat-ok`` / ``transcript ...`` then exits ``0``;
+* a session with no PIN streams frames;
+* the video pump (JPEG stills, pacing, cap, bounded termination).
 """
 
 from __future__ import annotations
@@ -31,11 +29,7 @@ import pytest
 
 from ecosys.v1 import ecosys_pb2, ecosys_pb2_grpc
 from ecosys_pi import camera, cli
-from ecosys_pi.token_store import Credentials, TokenStore
 
-TOKEN = "issued-token-cli"
-DEVICE_ID = "pi-device-cli"
-PIN = "123456"
 #: Generous timeout: a hang must FAIL the test, never block the suite.
 SUBPROCESS_TIMEOUT_S = 60.0
 
@@ -43,55 +37,31 @@ SUBPROCESS_TIMEOUT_S = 60.0
 class FakeHub(
     ecosys_pb2_grpc.PairingServiceServicer, ecosys_pb2_grpc.StreamServiceServicer
 ):
-    """An in-process hub for Pair + Heartbeat + OpenStream.
+    """An in-process hub for Heartbeat + OpenStream, with NO auth gate.
 
-    ``Pair`` pops a queued ``PairResponse`` (or returns a scripted default), so
-    a test can script an accept or a typed rejection. ``Heartbeat`` always
-    accepts. ``OpenStream`` yields one ``transcript`` per received audio frame,
-    mirroring the hub's mock STT adapter shape ``mock:<len>:<hash>``.
+    It records the invocation metadata of both calls so a test can prove the
+    client never sends an ``authorization`` header: pairing is gone, so the
+    stream is opened unauthenticated. ``Heartbeat`` always accepts.
+    ``OpenStream`` yields one ``transcript`` per received audio frame, mirroring
+    the hub's mock STT adapter shape ``mock:<len>:<hash>``.
     """
 
-    def __init__(
-        self,
-        *,
-        pair_responses: list[ecosys_pb2.PairResponse] | None = None,
-        pair_default: ecosys_pb2.PairResponse | None = None,
-        heartbeat_ok: bool = True,
-        reject_token: bool = False,
-    ) -> None:
-        self._pair_responses = list(pair_responses or [])
-        self._pair_default = pair_default
+    def __init__(self, *, heartbeat_ok: bool = True) -> None:
         self._heartbeat_ok = heartbeat_ok
-        self._reject_token = reject_token
-        self.pair_requests: list[ecosys_pb2.PairRequest] = []
         self.heartbeat_count = 0
         self.audio_frames = 0
-
-    def _check_token(self, context: grpc.ServicerContext) -> None:
-        if self._reject_token:
-            context.abort(grpc.StatusCode.UNAUTHENTICATED, "token refused")
-
-    @property
-    def pair_call_count(self) -> int:
-        return len(self.pair_requests)
-
-    def Pair(self, request, context):  # noqa: N802 - gRPC method name
-        self.pair_requests.append(request)
-        if self._pair_responses:
-            return self._pair_responses.pop(0)
-        if self._pair_default is not None:
-            return self._pair_default
-        return ecosys_pb2.PairResponse(ok=True, token=TOKEN, device_id=DEVICE_ID)
+        self.stream_metadata: list[dict[str, str]] = []
+        self.heartbeat_metadata: list[dict[str, str]] = []
 
     def Heartbeat(self, request, context):  # noqa: N802 - gRPC method name
-        self._check_token(context)
+        self.heartbeat_metadata.append(dict(context.invocation_metadata()))
         self.heartbeat_count += 1
         return ecosys_pb2.HeartbeatResponse(
             ok=self._heartbeat_ok, server_time_ms=1_700_000_000_000
         )
 
     def OpenStream(self, request_iterator, context):  # noqa: N802 - gRPC method name
-        self._check_token(context)
+        self.stream_metadata.append(dict(context.invocation_metadata()))
         for frame in request_iterator:
             if frame.HasField("audio_pcm16_16k"):
                 self.audio_frames += 1
@@ -125,10 +95,6 @@ class RunningHub:
         self._server.stop(None)
 
 
-def _reject(reason: str) -> ecosys_pb2.PairResponse:
-    return ecosys_pb2.PairResponse(ok=False, reject_reason=reason)
-
-
 def _cli_env(target: str | None, config_home: str) -> dict[str, str]:
     """A hermetic subprocess environment for one CLI run."""
     env = dict(os.environ)
@@ -159,8 +125,8 @@ def _run_cli(
     )
 
 
-def test_help_lists_every_frozen_flag() -> None:
-    """``--help`` advertises every flag the harness depends on."""
+def test_help_lists_the_runtime_flags() -> None:
+    """``--help`` advertises every runtime flag and no pairing flag."""
     result = subprocess.run(
         [sys.executable, "-m", "ecosys_pi", "--help"],
         capture_output=True,
@@ -169,123 +135,35 @@ def test_help_lists_every_frozen_flag() -> None:
     )
     assert result.returncode == 0
     help_text = result.stdout
-    for flag in ("--hub", "--pin", "--mode", "--frames", "--no-cache", "--lang"):
+    for flag in ("--hub", "--mode", "--frames", "--lang"):
         assert flag in help_text, f"{flag} missing from --help"
+    # Pairing/PIN were removed from the runtime, so their flags are gone.
+    assert "--pin" not in help_text
+    assert "--no-cache" not in help_text
     assert "HOST:PORT" in help_text
     assert "audio" in help_text and "video" in help_text and "both" in help_text
     assert "yue" in help_text and "zh" in help_text and "en" in help_text
 
 
-def test_happy_path_prints_frozen_contract_and_exits_zero(tmp_path) -> None:
-    """A fake hub accepts the PIN; stdout carries the exact contract lines."""
+def test_session_opens_unauthenticated_without_a_pin_and_exits_zero(tmp_path) -> None:
+    """A hub with no auth gate: the stream opens with no PIN and no token."""
     hub = FakeHub()
     with RunningHub(hub) as target:
         env = _cli_env(target, str(tmp_path))
-        result = _run_cli(
-            ["--pin", PIN, "--mode", "audio", "--frames", "3"],
-            env=env,
-        )
+        # No --pin, no cached token: the session must simply run.
+        result = _run_cli(["--mode", "audio", "--frames", "3"], env=env)
 
     lines = result.stdout.splitlines()
     assert result.returncode == 0, result.stderr
-    assert f"pair-ok device={DEVICE_ID}" in lines
     assert "heartbeat-ok" in lines
+    assert not any(line.startswith("pair-") for line in lines), "no pairing line"
     transcripts = [line for line in lines if line.startswith("transcript ")]
     assert transcripts, f"no transcript lines in {lines!r}"
     assert all(re.fullmatch(r"transcript mock:640", line) for line in transcripts)
-    # Frozen lines appear on stdout in the expected order.
-    assert lines.index(f"pair-ok device={DEVICE_ID}") < lines.index("heartbeat-ok")
     assert hub.audio_frames >= 1
-
-
-def test_refused_pin_prints_reason_and_exits_two_in_one_attempt(tmp_path) -> None:
-    """A bad PIN is a normal outcome: one attempt, typed reason, exit 2."""
-    hub = FakeHub(pair_default=_reject("pin-invalid"))
-    with RunningHub(hub) as target:
-        env = _cli_env(target, str(tmp_path))
-        result = _run_cli(
-            ["--pin", "000000", "--mode", "audio", "--frames", "1"],
-            env=env,
-        )
-
-    assert result.returncode == 2, result.stderr
-    assert "pair-rejected reason=pin-invalid" in result.stdout.splitlines()
-    assert hub.pair_call_count == 1, "non-interactive must make exactly ONE attempt"
-
-
-def test_no_cache_forces_a_fresh_pair_while_cache_skips_it(tmp_path) -> None:
-    """``--no-cache`` ignores the cache; a usable cache avoids a second Pair."""
-    hub = FakeHub()
-    with RunningHub(hub) as target:
-        env = _cli_env(target, str(tmp_path))
-
-        first = _run_cli(["--pin", PIN, "--mode", "audio", "--frames", "1"], env=env)
-        assert first.returncode == 0, first.stderr
-        assert hub.pair_call_count == 1
-
-        # A cached token (written by the first Pair) skips pairing entirely.
-        cached = _run_cli(["--mode", "audio", "--frames", "1"], env=env)
-        assert cached.returncode == 0, cached.stderr
-        assert hub.pair_call_count == 1, "a usable cache must not Pair again"
-        assert f"pair-ok device={DEVICE_ID}" not in cached.stdout.splitlines()
-
-        # --no-cache ignores that cache and pairs fresh.
-        forced = _run_cli(
-            ["--no-cache", "--pin", PIN, "--mode", "audio", "--frames", "1"],
-            env=env,
-        )
-        assert forced.returncode == 0, forced.stderr
-        assert hub.pair_call_count == 2, "--no-cache must force a fresh Pair"
-        assert f"pair-ok device={DEVICE_ID}" in forced.stdout.splitlines()
-
-
-def test_non_tty_without_pin_or_hub_errors_instead_of_hanging(tmp_path) -> None:
-    """No PIN, no hub, non-TTY stdin: a clear error and exit 1 (never a hang)."""
-    env = _cli_env(target=None, config_home=str(tmp_path))
-    # DEVNULL stdin is not a TTY; subprocess timeout turns a hang into a failure.
-    result = _run_cli(["--mode", "audio", "--frames", "1"], env=env)
-    assert result.returncode == 1, result.stderr
-    assert result.stdout.splitlines()[0].startswith("error: ")
-
-
-def test_non_tty_without_pin_but_with_hub_errors_locally(tmp_path) -> None:
-    """With a hub but no PIN/cache and no TTY, fail fast WITHOUT calling Pair."""
-    hub = FakeHub()
-    with RunningHub(hub) as target:
-        env = _cli_env(target, str(tmp_path))
-        result = _run_cli(["--mode", "audio", "--frames", "1"], env=env)
-
-    assert result.returncode == 1, result.stderr
-    assert result.stdout.splitlines()[0].startswith("error: ")
-    assert hub.pair_call_count == 0, "must refuse locally, never guess a PIN"
-
-
-def test_refused_token_prints_re_pair_requested(tmp_path) -> None:
-    """A stale/revoked token is a normal outcome: ``re-pair-requested``, exit 2."""
-    store = TokenStore.default({"XDG_CONFIG_HOME": str(tmp_path)})
-    store.save(Credentials(token=TOKEN, device_id=DEVICE_ID))
-    hub = FakeHub(reject_token=True)
-    with RunningHub(hub) as target:
-        env = _cli_env(target, str(tmp_path))
-        result = _run_cli(["--mode", "audio", "--frames", "1"], env=env)
-
-    assert result.returncode == 2, result.stderr
-    assert "re-pair-requested" in result.stdout.splitlines()
-    assert hub.pair_call_count == 0
-
-
-def test_cache_seeded_token_is_reused(tmp_path) -> None:
-    """A 0600 cache written directly is honoured by a later run."""
-    store = TokenStore.default({"XDG_CONFIG_HOME": str(tmp_path)})
-    store.save(Credentials(token=TOKEN, device_id=DEVICE_ID))
-    hub = FakeHub()
-    with RunningHub(hub) as target:
-        env = _cli_env(target, str(tmp_path))
-        result = _run_cli(["--mode", "audio", "--frames", "1"], env=env)
-
-    assert result.returncode == 0, result.stderr
-    assert hub.pair_call_count == 0
-    assert "pair-ok" not in result.stdout
+    # Pairing is gone: neither call carries a bearer token.
+    assert all("authorization" not in md for md in hub.stream_metadata)
+    assert all("authorization" not in md for md in hub.heartbeat_metadata)
 
 
 # --- Video pump: JPEG stills, None is "not ready", not "exhausted" (bug M2) --
@@ -396,14 +274,11 @@ def test_video_pump_honours_an_explicit_frame_cap() -> None:
 # --- The frozen stdout contract is referenced, not dead documentation --------
 
 
-def test_stdout_contract_is_the_six_frozen_lines() -> None:
-    """``STDOUT_CONTRACT`` pins exactly the six documented tokens."""
+def test_stdout_contract_is_the_frozen_lines() -> None:
+    """``STDOUT_CONTRACT`` pins exactly the lines still emitted after pairing."""
     assert cli.STDOUT_CONTRACT == (
-        "pair-ok device=<id>",
         "heartbeat-ok",
         "transcript <text>",
-        "pair-rejected reason=<r>",
-        "re-pair-requested",
         "error: <detail>",
     )
 

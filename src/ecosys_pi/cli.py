@@ -1,4 +1,4 @@
-"""The runnable Pi client: config -> pair -> heartbeat -> stream -> media/playback.
+"""The runnable Pi client: config -> discovery -> stream -> media/playback.
 
 ``python -m ecosys_pi`` is the single entry point task 14's JVM E2E harness
 drives. Its **stdout is a frozen contract** (see :data:`STDOUT_CONTRACT`): the
@@ -6,15 +6,17 @@ harness asserts these exact lines, so informational chatter from the media
 modules is redirected to stderr and our own lines are written to the captured
 stdout object explicitly.
 
-Flags (the harness uses ONLY these six)
----------------------------------------
+The stream is opened **unauthenticated**: pairing/PIN and bearer tokens were
+removed from the runtime, so the client only discovers the hub (an explicit
+``--hub`` / ``PI_ECOSYS_HUB`` / the default gateway) and dials it directly.
+
+Flags
+-----
 
 =============================  =================================================
 ``--hub HOST:PORT``            Hub override (default: gateway discovery).
-``--pin PIN``                  PIN override; forces ONE non-interactive Pair.
 ``--mode audio|video|both``    Which media producers run (default ``both``).
 ``--frames N``                 Frames per medium; ``0`` = run until interrupted.
-``--no-cache``                 Skip the token cache and force a fresh Pair.
 ``--lang yue|zh|en``           Override ``PI_ECOSYS_TTS_LANG``.
 =============================  =================================================
 
@@ -22,24 +24,12 @@ Frozen stdout / exit contract
 -----------------------------
 
 ===============================  ===============================================
-``pair-ok device=<id>``          Pair succeeded (``<id>`` from the credentials).
 ``heartbeat-ok``                 FIRST successful heartbeat.
 ``transcript <text>``            One received transcript frame.
-``pair-rejected reason=<r>``     Hub refused the PIN (typed reason verbatim).
-``re-pair-requested``            Token refused (``UNAUTHENTICATED``).
 ``error: <detail>``              Anything else.
 ===============================  ===============================================
 
-Exit codes: ``0`` success; ``2`` a normal hub refusal (bad/expired/locked PIN,
-or a refused token); ``1`` any other error.
-
-Non-interactive mode
---------------------
-
-When ``--pin`` is supplied OR stdin is not a TTY the client never blocks on
-``input()``. With ``--pin`` it makes exactly ONE Pair attempt; a rejection is
-printed and the process exits ``2``. A non-interactive run with no PIN and no
-cached token fails fast with an ``error:`` line instead of hanging.
+Exit codes: ``0`` success; ``1`` any error.
 """
 
 from __future__ import annotations
@@ -51,12 +41,11 @@ import logging
 import os
 import sys
 import time
-from typing import IO, Any, Mapping, Sequence
+from typing import IO, Mapping, Sequence
 
-from ecosys_pi.config import Config, load_config
-from ecosys_pi.token_store import Credentials, TokenStore
+from ecosys_pi.config import load_config
 
-__all__ = ["EXIT_OK", "EXIT_ERROR", "EXIT_REFUSED", "build_parser", "main"]
+__all__ = ["EXIT_OK", "EXIT_ERROR", "build_parser", "main"]
 
 _LOG = logging.getLogger("ecosys_pi.cli")
 
@@ -64,16 +53,11 @@ _LOG = logging.getLogger("ecosys_pi.cli")
 EXIT_OK = 0
 #: Any error that is NOT a normal hub refusal.
 EXIT_ERROR = 1
-#: A hub refusal that is a normal outcome: bad/expired/locked PIN, refused token.
-EXIT_REFUSED = 2
 
 #: The exact, frozen stdout tokens the E2E harness asserts (documentation only).
 STDOUT_CONTRACT = (
-    "pair-ok device=<id>",
     "heartbeat-ok",
     "transcript <text>",
-    "pair-rejected reason=<r>",
-    "re-pair-requested",
     "error: <detail>",
 )
 
@@ -88,12 +72,12 @@ _ANNOUNCE_GRACE_S = 2.0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the frozen six-flag argument parser."""
+    """Build the frozen runtime argument parser."""
     parser = argparse.ArgumentParser(
         prog="ecosys-pi",
         description=(
-            "Pair with the phone-manager hub and stream camera/microphone media "
-            "with hub-synthesized audio playback."
+            "Stream camera/microphone media to the phone-manager hub over an "
+            "unauthenticated stream, with hub-synthesized audio playback."
         ),
     )
     parser.add_argument(
@@ -101,12 +85,6 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="HOST:PORT",
         default=None,
         help="Hub address, overriding PI_ECOSYS_HUB and gateway discovery.",
-    )
-    parser.add_argument(
-        "--pin",
-        metavar="PIN",
-        default=None,
-        help="Pairing PIN, overriding the console. Forces ONE non-interactive Pair.",
     )
     parser.add_argument(
         "--mode",
@@ -122,11 +100,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Frames per medium; 0 (default) runs until interrupted.",
     )
     parser.add_argument(
-        "--no-cache",
-        action="store_true",
-        help="Ignore the cached token and force a fresh Pair.",
-    )
-    parser.add_argument(
         "--lang",
         choices=("yue", "zh", "en"),
         default=None,
@@ -139,21 +112,18 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     environ: Mapping[str, str] | None = None,
-    stdin: Any = None,
     stdout: IO[str] | None = None,
     stderr: IO[str] | None = None,
 ) -> int:
     """Run the client; return the process exit code.
 
-    ``argv``/``environ``/``stdin``/``stdout``/``stderr`` are injectable so tests
-    can drive the client without a console; defaults are the real process
-    objects.
+    ``argv``/``environ``/``stdout``/``stderr`` are injectable so tests can drive
+    the client without a console; defaults are the real process objects.
     """
     parser = build_parser()
     args = parser.parse_args(sys.argv[1:] if argv is None else list(argv))
 
     env = os.environ if environ is None else environ
-    in_stream = sys.stdin if stdin is None else stdin
     out: IO[str] = sys.stdout if stdout is None else stdout
     err: IO[str] = sys.stderr if stderr is None else stderr
 
@@ -161,26 +131,16 @@ def main(
     # fallback) must never pollute the frozen stdout contract; our own lines use
     # the captured ``out`` object explicitly, so they are unaffected.
     with contextlib.redirect_stdout(err):
-        return _dispatch(args, env, in_stream, out, err)
+        return _dispatch(args, env, out, err)
 
 
 def _dispatch(
     args: argparse.Namespace,
     env: Mapping[str, str],
-    stdin: Any,
     out: IO[str],
     err: IO[str],
 ) -> int:
-    """Resolve config, acquire credentials, then run the media session."""
-    import grpc
-
-    from ecosys_pi.pairing import (
-        PairProgrammingError,
-        PairRejected,
-        PairTransportError,
-        pair,
-    )
-
+    """Resolve config and hub, then run the media session unauthenticated."""
     from ecosys_pi.discovery import HubNotFoundError, resolve_hub
 
     cfg = load_config(env)
@@ -207,49 +167,11 @@ def _dispatch(
         _emit(out, f"error: --frames must be >= 0, got {args.frames}")
         return EXIT_ERROR
 
-    lang = args.lang or cfg.tts_lang
-    pin = args.pin if args.pin is not None else cfg.pin
-    store = TokenStore.default(env)
-
-    # --pin is an explicit override and --no-cache always ignores the cache;
-    # both force a fresh Pair. Otherwise a usable cached token skips pairing.
-    credentials: Credentials | None = (
-        None if (args.no_cache or args.pin is not None) else store.load()
-    )
-
-    if credentials is None:
-        if pin is None and not _stdin_is_tty(stdin):
-            _emit(
-                out,
-                "error: no cached token and no PIN supplied while stdin is not a "
-                "TTY; pass --pin PIN or run interactively",
-            )
-            return EXIT_ERROR
-
-        pair_config = Config(
-            hub=hub, pin=pin, tts_lang=lang, device_name=cfg.device_name
-        )
-        channel = grpc.insecure_channel(hub)
-        try:
-            credentials = pair(channel, pair_config, store=store)
-        except PairRejected as exc:
-            _emit(out, f"pair-rejected reason={exc.reason}")
-            return EXIT_REFUSED
-        except PairTransportError as exc:
-            _emit(out, f"error: {exc}")
-            return EXIT_ERROR
-        except PairProgrammingError as exc:
-            _emit(out, f"error: {exc}")
-            return EXIT_ERROR
-        finally:
-            channel.close()
-        _emit(out, f"pair-ok device={credentials.device_id}")
-
     try:
         return asyncio.run(
             _run_session(
                 hub,
-                credentials,
+                device_name=cfg.device_name,
                 mode=args.mode,
                 frames=args.frames,
                 env=env,
@@ -264,8 +186,8 @@ def _dispatch(
 
 async def _run_session(
     hub: str,
-    credentials: Credentials,
     *,
+    device_name: str,
     mode: str,
     frames: int,
     env: Mapping[str, str],
@@ -282,7 +204,7 @@ async def _run_session(
         select_audio_source,
     )
     from ecosys_pi.camera import select_video_source
-    from ecosys_pi.heartbeat import HeartbeatClient, UnauthenticatedError
+    from ecosys_pi.heartbeat import HeartbeatClient
     from ecosys_pi.stream import StreamClient, StreamTransportError
     from ecosys_pi.tts import build_player
 
@@ -314,16 +236,18 @@ async def _run_session(
 
     channel = aio.insecure_channel(hub)
     announce: asyncio.Task[None] | None = None
-    tasks: list[asyncio.Task[Any]] = []
+    tasks: list[asyncio.Task[object]] = []
     try:
+        # No token: pairing is gone, so the stream and heartbeat open
+        # unauthenticated (no bearer metadata is sent).
         client = StreamClient(
             channel,
-            credentials.token,
+            None,
             on_transcript,
             on_tts_audio=on_tts_audio,
             on_gesture=on_gesture,
         )
-        heartbeat = HeartbeatClient(channel, credentials.token, credentials.device_id)
+        heartbeat = HeartbeatClient(channel, None, device_name)
 
         stream_task = asyncio.create_task(client.run(), name="ecosys-cli-stream")
         beat_task = asyncio.create_task(heartbeat.run(), name="ecosys-cli-heartbeat")
@@ -371,9 +295,6 @@ async def _run_session(
             received,
         )
         return EXIT_OK
-    except UnauthenticatedError:
-        _emit(out, "re-pair-requested")
-        return EXIT_REFUSED
     except StreamTransportError as exc:
         _emit(out, f"error: {exc}")
         return EXIT_ERROR
@@ -388,14 +309,14 @@ async def _run_session(
         await channel.close()
 
 
-async def _gather(producers: Sequence[Any]) -> list[int]:
+async def _gather(producers: Sequence[object]) -> list[int]:
     """Await every producer coroutine; return their delivered frame counts."""
     if not producers:
         return []
     return list(await asyncio.gather(*producers))
 
 
-async def _announce_first_beat(heartbeat: Any, out: IO[str]) -> None:
+async def _announce_first_beat(heartbeat: object, out: IO[str]) -> None:
     """Print ``heartbeat-ok`` exactly once, when the hub accepts the first beat."""
     while heartbeat.beats_sent < 1:
         await asyncio.sleep(_BEAT_POLL_S)
@@ -403,8 +324,8 @@ async def _announce_first_beat(heartbeat: Any, out: IO[str]) -> None:
 
 
 async def _run_video(
-    source: Any,
-    client: Any,
+    source: object,
+    client: object,
     max_frames: int | None,
     *,
     err: IO[str],
@@ -456,14 +377,6 @@ async def _run_video(
         return sent
     finally:
         source.close()
-
-
-def _stdin_is_tty(stdin: Any) -> bool:
-    """Whether ``stdin`` is an interactive terminal (never raises)."""
-    try:
-        return bool(stdin.isatty())
-    except (AttributeError, ValueError):
-        return False
 
 
 def _emit(out: IO[str], line: str) -> None:

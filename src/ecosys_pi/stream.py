@@ -21,10 +21,10 @@ Hard rules (frozen protocol):
 * the ``__aiter__`` iterator API is NEVER mixed with ``write()`` -- mixing them
   on one call is unsupported;
 * ``done_writing()`` is called ONLY on shutdown, never after the first frame;
-* a transport drop reconnects with a BOUNDED number of attempts REUSING the
-  cached bearer token -- it never re-pairs;
-* ``UNAUTHENTICATED`` raises :class:`UnauthenticatedError` (the typed re-pair
-  signal) and is never retried.
+* the stream is opened UNAUTHENTICATED by default: ``token=None`` sends NO
+  ``authorization`` metadata (pairing/PIN were removed from the runtime). When a
+  token IS supplied it is reused across a transport drop;
+* ``UNAUTHENTICATED`` raises :class:`UnauthenticatedError` and is never retried.
 
 The caller owns the channel; this client never closes it.
 """
@@ -98,8 +98,8 @@ class StreamClient:
     def __init__(
         self,
         channel: aio.Channel,
-        token: str,
-        on_transcript: TranscriptCallback,
+        token: str | None = None,
+        on_transcript: TranscriptCallback = lambda _text: None,
         *,
         on_tts_audio: TtsAudioCallback | None = None,
         on_gesture: GestureCallback | None = None,
@@ -108,14 +108,15 @@ class StreamClient:
         reconnect_backoff: float = DEFAULT_RECONNECT_BACKOFF,
         shutdown_grace: float = DEFAULT_SHUTDOWN_GRACE,
     ) -> None:
-        if not token:
-            raise ValueError("token must be non-empty; pair before opening the stream")
+        if token is not None and not token:
+            raise ValueError("token must be a non-empty string or None")
         if queue_maxsize < 1:
             raise ValueError("queue_maxsize must be >= 1")
 
         self._channel = channel
-        # The token is cached for the whole client lifetime. A transport drop
-        # reconnects with THIS token; only UNAUTHENTICATED asks for a re-pair.
+        # ``None`` opens an UNAUTHENTICATED stream (no bearer metadata). A token,
+        # when supplied, is cached for the whole client lifetime; a transport
+        # drop reconnects with THIS token.
         self._token = token
         self._on_transcript = on_transcript
         # Optional per-payload callbacks: an unset one simply drops its frame.
@@ -229,8 +230,10 @@ class StreamClient:
             await asyncio.sleep(self._reconnect_backoff * attempt)
 
     def _open_call(self) -> aio.StreamStreamCall:
-        """Open one ``OpenStream`` call with the cached bearer token."""
+        """Open one ``OpenStream`` call: unauthenticated when no token is set."""
         stub = ecosys_pb2_grpc.StreamServiceStub(self._channel)
+        if self._token is None:
+            return stub.OpenStream()
         return stub.OpenStream(
             metadata=((AUTHORIZATION_HEADER, f"Bearer {self._token}"),)
         )

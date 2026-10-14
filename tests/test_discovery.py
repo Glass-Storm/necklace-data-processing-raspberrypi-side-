@@ -99,7 +99,6 @@ def test_cli_seam_reports_discovery_failure_and_exits_one(monkeypatch) -> None:
     code = cli.main(
         ["--mode", "audio", "--frames", "1"],
         environ={},
-        stdin=io.StringIO(),
         stdout=out,
         stderr=err,
     )
@@ -109,15 +108,14 @@ def test_cli_seam_reports_discovery_failure_and_exits_one(monkeypatch) -> None:
     assert ENV_HUB in line
 
 
-def test_cli_seam_consults_discovery_when_no_hub_configured(
+def test_cli_seam_uses_the_discovered_hub_without_pairing(
     monkeypatch, tmp_path
 ) -> None:
-    """With no ``--hub``/env, the CLI calls ``resolve_hub`` and moves past it.
+    """With no ``--hub``/env, the CLI calls ``resolve_hub`` and dials its result.
 
-    Discovery is stubbed to succeed; the run then stops at the local "no cached
-    token / no PIN" guard (non-TTY stdin), so no socket is dialed. Reaching that
-    guard - rather than the hub-missing error - proves the CLI consulted
-    discovery and used its result.
+    Discovery is stubbed to succeed and the session runner is replaced with a
+    sentinel, so this proves the CLI moved PAST discovery and used its address -
+    with no pairing step in between (pairing was removed from the runtime).
     """
     from ecosys_pi import cli
 
@@ -127,18 +125,22 @@ def test_cli_seam_consults_discovery_when_no_hub_configured(
         calls.append(override)
         return "127.0.0.1:1"
 
+    used: dict[str, object] = {}
+
+    async def fake_session(hub, *, device_name, mode, frames, env, out, err):
+        used["hub"] = hub
+        return cli.EXIT_OK
+
     monkeypatch.setattr(discovery, "resolve_hub", resolve)
+    monkeypatch.setattr(cli, "_run_session", fake_session)
 
     out = io.StringIO()
     code = cli.main(
         ["--mode", "audio", "--frames", "1"],
         environ={"XDG_CONFIG_HOME": str(tmp_path)},
-        stdin=io.StringIO(),
         stdout=out,
         stderr=io.StringIO(),
     )
-    lines = out.getvalue().splitlines()
     assert calls == [None], "discovery must be consulted when no hub is configured"
-    assert code == cli.EXIT_ERROR
-    assert lines[0].startswith("error: ")
-    assert "no cached token" in lines[0], "must have moved past the hub check"
+    assert used["hub"] == "127.0.0.1:1", "the CLI must dial the discovered hub"
+    assert code == cli.EXIT_OK
