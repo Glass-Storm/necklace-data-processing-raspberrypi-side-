@@ -288,7 +288,7 @@ def test_cache_seeded_token_is_reused(tmp_path) -> None:
     assert "pair-ok" not in result.stdout
 
 
-# --- Video pump: None is "not ready", not "exhausted" (bug M2) ---------------
+# --- Video pump: JPEG stills, None is "not ready", not "exhausted" (bug M2) --
 
 
 class _RecordingVideoClient:
@@ -301,34 +301,37 @@ class _RecordingVideoClient:
         self.frames.append(frame)
 
 
-class _GapThenNalsVideoSource:
-    """A camera-like source: ``read_nal`` returns ``None`` for a few polls.
+class _GapThenFramesVideoSource:
+    """A camera-like source: ``read_frame`` returns ``None`` for a few polls.
 
-    Mirrors a real ``Picamera2VideoSource``, where ``None`` is the normal "no NAL
-    queued yet" state. Once the gaps pass it yields its NALs, then reports
+    Mirrors a real ``JpegVideoSource``, where ``None`` is the normal "no still
+    ready yet" state. Once the gaps pass it yields its JPEGs, then reports
     ``done`` so a bounded pump can terminate.
     """
 
-    def __init__(self, nals: list[bytes], gaps: int = 2) -> None:
-        self._nals = list(nals)
+    width = 320
+    height = 240
+
+    def __init__(self, frames: list[bytes], gaps: int = 2) -> None:
+        self._frames = list(frames)
         self._gaps = gaps
         self._index = 0
 
     @property
     def done(self) -> bool:
-        return self._gaps <= 0 and self._index >= len(self._nals)
+        return self._gaps <= 0 and self._index >= len(self._frames)
 
     def open(self) -> bool:
         return True
 
-    def read_nal(self) -> bytes | None:
+    def read_frame(self) -> bytes | None:
         if self._gaps > 0:
             self._gaps -= 1
             return None
-        if self._index < len(self._nals):
-            nal = self._nals[self._index]
+        if self._index < len(self._frames):
+            frame = self._frames[self._index]
             self._index += 1
-            return nal
+            return frame
         return None
 
     def close(self) -> None:
@@ -344,35 +347,50 @@ def _run_video_pump(source: object, max_frames: int | None) -> tuple[int, list[o
     return sent, client.frames
 
 
-def test_video_pump_does_not_stop_on_an_empty_read_when_frames_unbounded() -> None:
-    """Bug M2: an initial ``None`` under ``--frames 0`` must NOT end the pump."""
-    nals = [camera.synthetic_video_nal(0), camera.synthetic_video_nal(1)]
-    source = _GapThenNalsVideoSource(nals, gaps=3)
+def test_video_frame_interval_is_the_10fps_cadence() -> None:
+    """The pump paces at exactly 10 frames per second (0.1 s)."""
+    assert cli._VIDEO_FRAME_INTERVAL_S == 0.1
+
+
+def test_video_pump_sends_image_frames_for_the_cap() -> None:
+    """Bug M2 + the JPEG contract: N ``--frames N`` sends N ``image`` frames."""
+    jpeg = camera.synthetic_jpeg_frame()
+    source = _GapThenFramesVideoSource([jpeg, jpeg], gaps=3)
 
     sent, frames = _run_video_pump(source, max_frames=None)
 
     assert sent == 2, "an empty read must not abort an unbounded video pump"
-    assert [frame.video_h264_nal for frame in frames] == nals
+    assert [frame.WhichOneof("payload") for frame in frames] == ["image", "image"]
+    assert [frame.image.jpeg for frame in frames] == [jpeg, jpeg]
+
+
+def test_video_pump_sends_320x240_dimensions_on_every_frame() -> None:
+    source = camera.SyntheticJpegSource(frame_count=2)
+
+    sent, frames = _run_video_pump(source, max_frames=None)
+
+    assert sent == 2
+    assert [(frame.image.width, frame.image.height) for frame in frames] == [
+        (320, 240),
+        (320, 240),
+    ]
 
 
 def test_video_pump_terminates_when_a_bounded_source_is_done() -> None:
     """A capped synthetic source still terminates an unbounded pump."""
-    source = camera.SyntheticVideoSource(frame_count=3)
+    source = camera.SyntheticJpegSource(frame_count=3)
 
     sent, frames = _run_video_pump(source, max_frames=None)
 
     assert sent == 3
-    assert [frame.video_h264_nal for frame in frames] == [
-        camera.synthetic_video_nal(0),
-        camera.synthetic_video_nal(1),
-        camera.synthetic_video_nal(2),
-    ]
+    assert all(frame.WhichOneof("payload") == "image" for frame in frames)
 
 
 def test_video_pump_honours_an_explicit_frame_cap() -> None:
-    source = camera.SyntheticVideoSource()
-    sent, _frames = _run_video_pump(source, max_frames=2)
+    source = camera.SyntheticJpegSource()
+    sent, frames = _run_video_pump(source, max_frames=2)
     assert sent == 2
+    assert len(frames) == 2
 
 
 # --- The frozen stdout contract is referenced, not dead documentation --------

@@ -50,6 +50,7 @@ import contextlib
 import logging
 import os
 import sys
+import time
 from typing import IO, Any, Mapping, Sequence
 
 from ecosys_pi.config import Config, load_config
@@ -76,8 +77,8 @@ STDOUT_CONTRACT = (
     "error: <detail>",
 )
 
-#: Pace for the video pump: one NAL per nominal capture frame (30 fps).
-_VIDEO_FRAME_INTERVAL_S = 1.0 / 30.0
+#: Pace for the video pump: one JPEG still per capture frame (10 fps).
+_VIDEO_FRAME_INTERVAL_S = 0.1
 
 #: How often the heartbeat announcer polls for the first accepted beat.
 _BEAT_POLL_S = 0.01
@@ -392,17 +393,19 @@ async def _run_video(
     err: IO[str],
     interval: float = _VIDEO_FRAME_INTERVAL_S,
 ) -> int:
-    """Pump H.264 NALs from ``source`` into the stream until the cap is reached.
+    """Pump 320x240 JPEG stills from ``source`` into the stream until capped.
 
     ``max_frames is None`` runs until the source is exhausted or the process is
-    interrupted. ``read_nal()`` returns ``None`` both when a live camera has no
-    NAL queued yet and when a bounded source is exhausted, so this loop consults
+    interrupted. ``read_frame()`` returns ``None`` both when a live camera has no
+    still ready yet and when a bounded source is exhausted, so this loop consults
     ``source.done`` to tell those apart: a live camera is never done and the pump
     simply keeps polling, while a bounded source stops. A real camera paces
-    itself; this loop also paces the (synthetic) source at the nominal 30 fps so
-    it never floods the bounded queue.
+    itself; this loop also paces the (synthetic) source at the nominal 10 fps so
+    it never floods the wire.
     """
     from ecosys.v1 import ecosys_pb2
+
+    from ecosys_pi.camera import DEFAULT_HEIGHT, DEFAULT_WIDTH
 
     if not source.open():
         print(
@@ -410,16 +413,27 @@ async def _run_video(
         )
         return 0
 
+    width = getattr(source, "width", DEFAULT_WIDTH)
+    height = getattr(source, "height", DEFAULT_HEIGHT)
     sent = 0
     try:
         while max_frames is None or sent < max_frames:
-            nal = source.read_nal()
-            if nal is None:
+            jpeg = source.read_frame()
+            if jpeg is None:
                 if source.done:
                     break
                 await asyncio.sleep(interval)
                 continue
-            await client.send(ecosys_pb2.StreamFrame(video_h264_nal=nal))
+            await client.send(
+                ecosys_pb2.StreamFrame(
+                    image=ecosys_pb2.ImageFrame(
+                        jpeg=jpeg,
+                        pts_ms=time.monotonic_ns() // 1_000_000,
+                        width=width,
+                        height=height,
+                    )
+                )
+            )
             sent += 1
             await asyncio.sleep(interval)
         return sent
