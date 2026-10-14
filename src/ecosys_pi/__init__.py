@@ -14,8 +14,7 @@ The subsystems are:
 * :mod:`ecosys_pi.discovery` / :mod:`ecosys_pi.network` -- hub resolution
   (explicit override, ``PI_ECOSYS_HUB``, then the default gateway) and the
   ``nmcli`` hotspot join.
-* :mod:`ecosys_pi.heartbeat` / :mod:`ecosys_pi.stream`
-  -- the heartbeat and bidirectional-stream clients.
+* :mod:`ecosys_pi.stream` -- the bidirectional-stream client.
 * :mod:`ecosys_pi.audio` / :mod:`ecosys_pi.camera` -- the mic and JPEG camera
   sources plus the paced audio producer.
 * :mod:`ecosys_pi.tts` -- playback of hub-synthesized speech (PCM16 @ 16 kHz).

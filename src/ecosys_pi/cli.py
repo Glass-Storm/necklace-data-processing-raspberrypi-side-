@@ -24,7 +24,6 @@ Frozen stdout / exit contract
 -----------------------------
 
 ===============================  ===============================================
-``heartbeat-ok``                 FIRST successful heartbeat.
 ``transcript <text>``            One received transcript frame.
 ``error: <detail>``              Anything else.
 ===============================  ===============================================
@@ -56,19 +55,12 @@ EXIT_ERROR = 1
 
 #: The exact, frozen stdout tokens the E2E harness asserts (documentation only).
 STDOUT_CONTRACT = (
-    "heartbeat-ok",
     "transcript <text>",
     "error: <detail>",
 )
 
 #: Pace for the video pump: one JPEG still per capture frame (10 fps).
 _VIDEO_FRAME_INTERVAL_S = 0.1
-
-#: How often the heartbeat announcer polls for the first accepted beat.
-_BEAT_POLL_S = 0.01
-
-#: Seconds to wait for the first accepted heartbeat to be announced.
-_ANNOUNCE_GRACE_S = 2.0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -171,7 +163,6 @@ def _dispatch(
         return asyncio.run(
             _run_session(
                 hub,
-                device_name=cfg.device_name,
                 mode=args.mode,
                 frames=args.frames,
                 env=env,
@@ -187,14 +178,13 @@ def _dispatch(
 async def _run_session(
     hub: str,
     *,
-    device_name: str,
     mode: str,
     frames: int,
     env: Mapping[str, str],
     out: IO[str],
     err: IO[str],
 ) -> int:
-    """Run heartbeat + stream + media producers until the frame cap is reached."""
+    """Run the stream + media producers until the frame cap is reached."""
     from grpc import aio
 
     from ecosys_pi.audio import (
@@ -204,7 +194,6 @@ async def _run_session(
         select_audio_source,
     )
     from ecosys_pi.camera import select_video_source
-    from ecosys_pi.heartbeat import HeartbeatClient
     from ecosys_pi.stream import StreamClient, StreamTransportError
     from ecosys_pi.tts import build_player
 
@@ -235,10 +224,9 @@ async def _run_session(
         print(f"[Pi Gesture] {text}", file=err)
 
     channel = aio.insecure_channel(hub)
-    announce: asyncio.Task[None] | None = None
     tasks: list[asyncio.Task[object]] = []
     try:
-        # No token: pairing is gone, so the stream and heartbeat open
+        # No token: pairing was removed from the runtime, so the stream opens
         # unauthenticated (no bearer metadata is sent).
         client = StreamClient(
             channel,
@@ -247,13 +235,8 @@ async def _run_session(
             on_tts_audio=on_tts_audio,
             on_gesture=on_gesture,
         )
-        heartbeat = HeartbeatClient(channel, None, device_name)
 
         stream_task = asyncio.create_task(client.run(), name="ecosys-cli-stream")
-        beat_task = asyncio.create_task(heartbeat.run(), name="ecosys-cli-heartbeat")
-        announce = asyncio.create_task(
-            _announce_first_beat(heartbeat, out), name="ecosys-cli-announce"
-        )
 
         producers = []
         if audio_enabled:
@@ -266,27 +249,20 @@ async def _run_session(
             producers.append(_run_video(video_source, client, max_frames, err=err))
 
         outcome = asyncio.create_task(_gather(producers), name="ecosys-cli-producers")
-        tasks = [stream_task, beat_task, announce, outcome]
+        tasks = [stream_task, outcome]
 
         done, _pending = await asyncio.wait(
-            {outcome, stream_task, beat_task}, return_when=asyncio.FIRST_COMPLETED
+            {outcome, stream_task}, return_when=asyncio.FIRST_COMPLETED
         )
         for task in done:
             exc = task.exception()
             if exc is not None:
                 raise exc
 
-        # Normal completion: every producer hit its cap. Stop beating, then
-        # half-close the stream and let it drain the hub's remaining frames.
-        heartbeat.stop()
+        # Normal completion: every producer hit its cap. Half-close the stream
+        # and let it drain the hub's remaining frames.
         client.close()
         await stream_task
-        await beat_task
-        # A slow first heartbeat must not lose the frozen line to a short session.
-        try:
-            await asyncio.wait_for(announce, timeout=_ANNOUNCE_GRACE_S)
-        except asyncio.TimeoutError:
-            pass
 
         _LOG.info(
             "session finished: audio/video capped at %s frame(s) per medium, "
@@ -314,13 +290,6 @@ async def _gather(producers: Sequence[object]) -> list[int]:
     if not producers:
         return []
     return list(await asyncio.gather(*producers))
-
-
-async def _announce_first_beat(heartbeat: object, out: IO[str]) -> None:
-    """Print ``heartbeat-ok`` exactly once, when the hub accepts the first beat."""
-    while heartbeat.beats_sent < 1:
-        await asyncio.sleep(_BEAT_POLL_S)
-    _emit(out, "heartbeat-ok")
 
 
 async def _run_video(

@@ -9,7 +9,7 @@ Coverage:
 
 * ``--help`` lists every runtime flag (and no pairing flag);
 * a happy path opens the stream UNAUTHENTICATED (no bearer token, no pairing)
-  and prints ``heartbeat-ok`` / ``transcript ...`` then exits ``0``;
+  and prints ``transcript ...`` then exits ``0``;
 * a session with no PIN streams frames;
 * the video pump (JPEG stills, pacing, cap, bounded termination).
 """
@@ -34,31 +34,19 @@ from ecosys_pi import camera, cli
 SUBPROCESS_TIMEOUT_S = 60.0
 
 
-class FakeHub(
-    ecosys_pb2_grpc.PairingServiceServicer, ecosys_pb2_grpc.StreamServiceServicer
-):
-    """An in-process hub for Heartbeat + OpenStream, with NO auth gate.
+class FakeHub(ecosys_pb2_grpc.StreamServiceServicer):
+    """An in-process hub for ``OpenStream``, with NO auth gate.
 
-    It records the invocation metadata of both calls so a test can prove the
-    client never sends an ``authorization`` header: pairing is gone, so the
-    stream is opened unauthenticated. ``Heartbeat`` always accepts.
-    ``OpenStream`` yields one ``transcript`` per received audio frame, mirroring
-    the hub's mock STT adapter shape ``mock:<len>:<hash>``.
+    It records the stream's invocation metadata so a test can prove the client
+    never sends an ``authorization`` header: pairing was removed from the
+    runtime, so the stream opens unauthenticated. ``OpenStream`` yields one
+    ``transcript`` per received audio frame, mirroring the hub's mock STT adapter
+    shape ``mock:<len>:<hash>``.
     """
 
-    def __init__(self, *, heartbeat_ok: bool = True) -> None:
-        self._heartbeat_ok = heartbeat_ok
-        self.heartbeat_count = 0
+    def __init__(self) -> None:
         self.audio_frames = 0
         self.stream_metadata: list[dict[str, str]] = []
-        self.heartbeat_metadata: list[dict[str, str]] = []
-
-    def Heartbeat(self, request, context):  # noqa: N802 - gRPC method name
-        self.heartbeat_metadata.append(dict(context.invocation_metadata()))
-        self.heartbeat_count += 1
-        return ecosys_pb2.HeartbeatResponse(
-            ok=self._heartbeat_ok, server_time_ms=1_700_000_000_000
-        )
 
     def OpenStream(self, request_iterator, context):  # noqa: N802 - gRPC method name
         self.stream_metadata.append(dict(context.invocation_metadata()))
@@ -81,7 +69,6 @@ class RunningHub:
     def __init__(self, hub: FakeHub) -> None:
         self.hub = hub
         self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
-        ecosys_pb2_grpc.add_PairingServiceServicer_to_server(hub, self._server)
         ecosys_pb2_grpc.add_StreamServiceServicer_to_server(hub, self._server)
         port = self._server.add_insecure_port("127.0.0.1:0")
         assert port != 0, "failed to bind an ephemeral port"
@@ -155,15 +142,13 @@ def test_session_opens_unauthenticated_without_a_pin_and_exits_zero(tmp_path) ->
 
     lines = result.stdout.splitlines()
     assert result.returncode == 0, result.stderr
-    assert "heartbeat-ok" in lines
     assert not any(line.startswith("pair-") for line in lines), "no pairing line"
     transcripts = [line for line in lines if line.startswith("transcript ")]
     assert transcripts, f"no transcript lines in {lines!r}"
     assert all(re.fullmatch(r"transcript mock:640", line) for line in transcripts)
     assert hub.audio_frames >= 1
-    # Pairing is gone: neither call carries a bearer token.
+    # Pairing was removed: the stream carries no bearer token.
     assert all("authorization" not in md for md in hub.stream_metadata)
-    assert all("authorization" not in md for md in hub.heartbeat_metadata)
 
 
 # --- Video pump: JPEG stills, None is "not ready", not "exhausted" (bug M2) --
@@ -275,9 +260,8 @@ def test_video_pump_honours_an_explicit_frame_cap() -> None:
 
 
 def test_stdout_contract_is_the_frozen_lines() -> None:
-    """``STDOUT_CONTRACT`` pins exactly the lines still emitted after pairing."""
+    """``STDOUT_CONTRACT`` pins exactly the lines still emitted after retirement."""
     assert cli.STDOUT_CONTRACT == (
-        "heartbeat-ok",
         "transcript <text>",
         "error: <detail>",
     )
