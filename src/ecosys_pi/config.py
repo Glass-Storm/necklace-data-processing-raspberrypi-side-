@@ -1,34 +1,51 @@
 """Runtime configuration for the ecosys Pi client.
 
-Every knob is read from an environment variable so the same code runs on the
-bench and on a real Pi without edits. ``load_config`` is the single entry point;
-it never mutates ``os.environ`` and never logs a secret.
+``load_config`` is the single entry point. It merges four layers, highest
+precedence first:
 
-Environment variables and documented defaults
----------------------------------------------
+1. **Real process environment** (``os.environ``) — only the ``PI_ECOSYS_*``
+   names are honoured here, so an unrelated OS variable named ``password`` or
+   ``hub`` can never leak into the config.
+2. **A ``.env`` file** (parsed with :func:`python_dotenv.dotenv_values`; the
+   process environment is **never** mutated).
+3. **A ``config.json`` file** — the same settings, expressed as JSON.
+4. **Built-in defaults.**
 
-======================  =========================  ==========================
-Variable                Default                    Notes
-======================  =========================  ==========================
-``PI_ECOSYS_HUB``       *(unset)*                  ``HOST:PORT`` override for
-                                                   hub discovery (task 13). A
-                                                   blank value is treated as
-                                                   unset.
-``PI_ECOSYS_PIN``       *(unset)*                  **Scripting only.** This is
-                                                   NOT durable config: the PIN
-                                                   is single-use with a 120 s
-                                                   TTL. Interactive runs read
-                                                   the PIN from the console.
-``PI_ECOSYS_TTS_LANG``  ``yue``                    One of ``yue``/``zh``/``en``.
-                                                   A blank or unknown value
-                                                   falls back to ``yue``.
-``PI_ECOSYS_DEVICE_NAME`` ``socket.gethostname()`` Non-blank label sent to the
-                                                   hub. Blank values fall back
-                                                   to the hostname.
-======================  =========================  ==========================
+For a single setting the highest layer that supplies a **non-blank** value wins;
+a blank value is treated as unset and falls through to the next layer down.
 
-The PIN and the bearer token are secrets: ``Config.__repr__`` redacts the PIN so
-it can never leak through a stray ``print``/log of the config object.
+Files and discovery
+-------------------
+
+By default the ``.env`` and ``config.json`` files are discovered in the current
+working directory. When ``environ`` is passed explicitly (the injectable,
+unit-test path) file discovery is **disabled** unless ``dotenv_path`` /
+``config_path`` are given — so an injected run is hermetic and never depends on
+whatever happens to sit in the working tree.
+
+Settings
+--------
+
+========================  ============================  ==========================
+Setting                   Canonical env var             Default
+========================  ============================  ==========================
+``hub``                   ``PI_ECOSYS_HUB``             *(unset)* → mDNS discovery
+``pin``                   ``PI_ECOSYS_PIN``             *(unset)* → console prompt
+``tts_lang``              ``PI_ECOSYS_TTS_LANG``        ``yue``
+``device_name``           ``PI_ECOSYS_DEVICE_NAME``     ``socket.gethostname()``
+``ssid``                  ``PI_ECOSYS_SSID``            *(unset)*
+``password``              ``PI_ECOSYS_HOTSPOT_PASSWORD``*(unset)*
+``enrollment_seconds``    ``PI_ECOSYS_ENROLLMENT_SECONDS``      ``8``
+``hub_port``              ``PI_ECOSYS_HUB_PORT``        ``50051``
+========================  ============================  ==========================
+
+Inside a ``.env`` or ``config.json`` file a setting may be spelled either with
+its canonical ``PI_ECOSYS_*`` name or with its short key (e.g. ``ssid``); the
+match is case-insensitive. ``PI_ECOSYS_PIN`` is **scripting only** — the PIN is
+single-use with a 120 s TTL, so it is not durable config.
+
+The PIN and the hotspot password are secrets: :meth:`Config.__repr__` redacts
+both so they can never leak through a stray ``print``/log of the config object.
 
 systemd service-user caveat
 ---------------------------
@@ -36,35 +53,83 @@ systemd service-user caveat
 This module reads the *process environment*. A systemd unit started for a
 service user (``User=ecosys``) gets a **fresh, minimal environment** - it does
 NOT inherit your login shell's exports. Set variables with ``Environment=`` /
-``EnvironmentFile=`` in the unit, or the defaults apply. The same caveat applies
-to ``XDG_CONFIG_HOME`` used by :mod:`ecosys_pi.token_store`: if the service user
-has no ``XDG_CONFIG_HOME``, the cache lands in that user's ``~/.config`` and the
+``EnvironmentFile=`` in the unit, or point ``PI_ECOSYS_*`` at a ``.env`` /
+``config.json`` file, or the defaults apply. The same caveat applies to
+``XDG_CONFIG_HOME`` used by :mod:`ecosys_pi.token_store`: if the service user has
+no ``XDG_CONFIG_HOME``, the cache lands in that user's ``~/.config`` and the
 service account must own that directory with mode ``0700``.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import socket
-from dataclasses import dataclass
 from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from dotenv import dotenv_values
 
 __all__ = [
+    "DEFAULT_CONFIG_FILENAME",
+    "DEFAULT_DOTENV_FILENAME",
+    "DEFAULT_ENROLLMENT_SECONDS",
+    "DEFAULT_HUB_PORT",
     "DEFAULT_TTS_LANG",
     "SUPPORTED_TTS_LANGS",
     "Config",
     "load_config",
 ]
 
-#: Languages the local TTS layer can speak (tasks 11/12). See
-#: :mod:`ecosys_pi.tts` for the per-language engine mapping.
+#: Languages the local TTS layer can speak. See :mod:`ecosys_pi.tts` for the
+#: per-language engine mapping.
 SUPPORTED_TTS_LANGS: frozenset[str] = frozenset({"yue", "zh", "en"})
 
 #: Documented fallback for ``PI_ECOSYS_TTS_LANG`` when it is blank or unknown.
 DEFAULT_TTS_LANG: str = "yue"
 
+#: Default voice-enrolment length in seconds (plan task 13).
+DEFAULT_ENROLLMENT_SECONDS: int = 8
+
+#: Default hub gRPC port, used when only the gateway host is known.
+DEFAULT_HUB_PORT: int = 50051
+
+#: File discovered in the working directory for the dotenv layer.
+DEFAULT_DOTENV_FILENAME: str = ".env"
+
+#: File discovered in the working directory for the JSON config layer.
+DEFAULT_CONFIG_FILENAME: str = "config.json"
+
 #: Fallback device label when the hostname is blank (e.g. a container).
 _FALLBACK_DEVICE_NAME = "ecosys-pi"
+
+#: The largest valid TCP/UDP port number.
+_MAX_PORT = 65535
+
+#: Per-setting accepted spellings, most-canonical first. Each tuple lists the
+#: canonical ``PI_ECOSYS_*`` env var name (and any aliases) before the short
+#: key(s). Matching is case-insensitive for the file layers; only names starting
+#: ``PI_ECOSYS_`` are ever read from the real process environment.
+_SETTING_ALIASES: Mapping[str, tuple[str, ...]] = {
+    "hub": ("PI_ECOSYS_HUB", "hub"),
+    "pin": ("PI_ECOSYS_PIN", "pin"),
+    "tts_lang": ("PI_ECOSYS_TTS_LANG", "tts_lang"),
+    "device_name": ("PI_ECOSYS_DEVICE_NAME", "device_name"),
+    "ssid": ("PI_ECOSYS_SSID", "ssid"),
+    "password": (
+        "PI_ECOSYS_HOTSPOT_PASSWORD",
+        "PI_ECOSYS_PASSWORD",
+        "hotspot_password",
+        "password",
+    ),
+    "enrollment_seconds": ("PI_ECOSYS_ENROLLMENT_SECONDS", "enrollment_seconds"),
+    "hub_port": ("PI_ECOSYS_HUB_PORT", "hub_port"),
+}
+
+#: Prefix that marks a name as a real-process-environment variable.
+_ENV_PREFIX = "PI_ECOSYS_"
 
 
 def _clean(value: str | None) -> str | None:
@@ -84,15 +149,113 @@ def _default_device_name() -> str:
     return hostname or _FALLBACK_DEVICE_NAME
 
 
+def _normalise(source: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a case-insensitive view of ``source`` keyed by ``str(key).lower()``."""
+    return {str(key).strip().lower(): value for key, value in source.items()}
+
+
+def _lookup(
+    source: Mapping[str, Any],
+    aliases: tuple[str, ...],
+    *,
+    env_only: bool,
+) -> str | None:
+    """First non-blank value among ``aliases`` in a normalised ``source``.
+
+    ``env_only`` restricts the search to ``PI_ECOSYS_*`` names so the real
+    process environment cannot contribute a generic ``password``/``hub`` key.
+    """
+    for alias in aliases:
+        key = alias.lower()
+        if env_only and not key.startswith(_ENV_PREFIX.lower()):
+            continue
+        value = source.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _read_config_file(path: str | os.PathLike[str] | None) -> dict[str, Any]:
+    """Parse a JSON ``config.json``; a missing/malformed/non-object file is ``{}``."""
+    if path is None:
+        return {}
+    resolved = Path(path)
+    if not resolved.is_file():
+        return {}
+    try:
+        data = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_dotenv(path: str | os.PathLike[str] | None) -> dict[str, str]:
+    """Parse a ``.env`` without mutating ``os.environ``; missing file is ``{}``."""
+    if path is None:
+        return {}
+    resolved = Path(path)
+    if not resolved.is_file():
+        return {}
+    try:
+        values = dotenv_values(resolved)
+    except OSError:  # pragma: no cover - is_file() already filtered the common case
+        return {}
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def _merge(
+    *,
+    config_file: Mapping[str, Any],
+    dotenv: Mapping[str, Any],
+    environ: Mapping[str, Any],
+) -> dict[str, str]:
+    """Resolve every setting with precedence env > .env > file > (defaults)."""
+    layers = (
+        (_normalise(config_file), False),
+        (_normalise(dotenv), False),
+        (_normalise(environ), True),
+    )
+    resolved: dict[str, str] = {}
+    for setting, aliases in _SETTING_ALIASES.items():
+        for source, env_only in layers:
+            value = _lookup(source, aliases, env_only=env_only)
+            if value is not None:
+                resolved[setting] = value
+    return resolved
+
+
+def _bounded_int(
+    raw: str | None, default: int, *, minimum: int, maximum: int | None = None
+) -> int:
+    """Parse ``raw`` as an int within ``[minimum, maximum]``, else ``default``."""
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    if value < minimum:
+        return default
+    if maximum is not None and value > maximum:
+        return default
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     """Immutable, validated runtime configuration.
 
     Build it with :func:`load_config` rather than calling the constructor so the
-    environment-variable parsing and fallbacks are applied consistently.
+    environment/file parsing and fallbacks are applied consistently. The four
+    original fields are positional for backward compatibility; the task-13
+    fields (``ssid``/``password``/``enrollment_seconds``/``hub_port``) all carry
+    defaults so existing keyword constructions keep working unchanged.
     """
 
-    #: ``HOST:PORT`` hub override, or ``None`` to use mDNS discovery (task 13).
+    #: ``HOST:PORT`` hub override, or ``None`` to use mDNS discovery.
     hub: str | None
     #: Scripting-only PIN override, or ``None`` to prompt on the console.
     pin: str | None
@@ -100,35 +263,87 @@ class Config:
     tts_lang: str
     #: Non-blank device label sent in ``PairRequest.device_name``.
     device_name: str
+    #: Hotspot SSID the Pi joins (task 12), or ``None`` when unset.
+    ssid: str | None = None
+    #: Hotspot WPA2/WPA3 password (task 12), or ``None`` when unset. A secret.
+    password: str | None = None
+    #: Voice-enrolment capture length in seconds (task 13).
+    enrollment_seconds: int = DEFAULT_ENROLLMENT_SECONDS
+    #: Hub gRPC port, used when only the gateway host is known (task 12).
+    hub_port: int = DEFAULT_HUB_PORT
 
     def __repr__(self) -> str:
-        # NEVER leak the PIN (or a future token) through repr/print/logging.
+        # NEVER leak the PIN or the hotspot password through repr/print/logging.
         pin = "<set>" if self.pin is not None else "<unset>"
+        password = "<set>" if self.password is not None else "<unset>"
         return (
-            f"Config(hub={self.hub!r}, pin={pin}, "
-            f"tts_lang={self.tts_lang!r}, device_name={self.device_name!r})"
+            f"Config(hub={self.hub!r}, pin={pin}, tts_lang={self.tts_lang!r}, "
+            f"device_name={self.device_name!r}, ssid={self.ssid!r}, "
+            f"password={password}, enrollment_seconds={self.enrollment_seconds!r}, "
+            f"hub_port={self.hub_port!r})"
         )
 
 
-def load_config(environ: Mapping[str, str] | None = None) -> Config:
-    """Read configuration from ``environ`` (defaults to ``os.environ``).
+def load_config(
+    environ: Mapping[str, str] | None = None,
+    *,
+    dotenv_path: str | os.PathLike[str] | None = None,
+    config_path: str | os.PathLike[str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+) -> Config:
+    """Resolve configuration from env files and the process environment.
 
-    A blank ``PI_ECOSYS_TTS_LANG`` - or one outside
-    :data:`SUPPORTED_TTS_LANGS` - falls back to :data:`DEFAULT_TTS_LANG`
-    (``yue``). A blank ``PI_ECOSYS_DEVICE_NAME`` falls back to the hostname;
-    the result is always non-blank so the hub never reports ``name-missing``.
+    Precedence, highest first: real process env > ``.env`` > ``config.json`` >
+    built-in defaults. A blank value is treated as unset and falls through.
+
+    ``environ`` defaults to ``os.environ``. Passing it explicitly marks an
+    injected (unit-test) run: file discovery is then **off** unless
+    ``dotenv_path``/``config_path`` are supplied, keeping the run hermetic.
+    When ``environ`` is ``None`` the two files are discovered in ``cwd``
+    (default: the current working directory). A blank
+    ``PI_ECOSYS_TTS_LANG`` - or one outside :data:`SUPPORTED_TTS_LANGS` - falls
+    back to :data:`DEFAULT_TTS_LANG` (``yue``). A blank device name falls back to
+    the hostname; the result is always non-blank so the hub never reports
+    ``name-missing``.
+
+    This function never mutates ``os.environ``: the ``.env`` file is parsed with
+    :func:`python_dotenv.dotenv_values`, not ``load_dotenv``.
     """
+    injected = environ is not None
     env = os.environ if environ is None else environ
+    base = Path(cwd) if cwd is not None else Path.cwd()
 
-    lang = _clean(env.get("PI_ECOSYS_TTS_LANG"))
+    if config_path is None and not injected:
+        config_path = base / DEFAULT_CONFIG_FILENAME
+    if dotenv_path is None and not injected:
+        dotenv_path = base / DEFAULT_DOTENV_FILENAME
+
+    merged = _merge(
+        config_file=_read_config_file(config_path),
+        dotenv=_read_dotenv(dotenv_path),
+        environ=env,
+    )
+
+    lang = merged.get("tts_lang")
     if lang not in SUPPORTED_TTS_LANGS:
         lang = DEFAULT_TTS_LANG
 
-    device_name = _clean(env.get("PI_ECOSYS_DEVICE_NAME")) or _default_device_name()
-
     return Config(
-        hub=_clean(env.get("PI_ECOSYS_HUB")),
-        pin=_clean(env.get("PI_ECOSYS_PIN")),
+        hub=merged.get("hub"),
+        pin=merged.get("pin"),
         tts_lang=lang,
-        device_name=device_name,
+        device_name=merged.get("device_name") or _default_device_name(),
+        ssid=merged.get("ssid"),
+        password=merged.get("password"),
+        enrollment_seconds=_bounded_int(
+            merged.get("enrollment_seconds"),
+            DEFAULT_ENROLLMENT_SECONDS,
+            minimum=1,
+        ),
+        hub_port=_bounded_int(
+            merged.get("hub_port"),
+            DEFAULT_HUB_PORT,
+            minimum=1,
+            maximum=_MAX_PORT,
+        ),
     )
