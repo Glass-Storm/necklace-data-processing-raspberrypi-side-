@@ -8,9 +8,12 @@
 # Key=value lines (not INI) so both humans and shell/CI can parse them.
 source_repo=phone-manager
 source_path=contract/src/main/proto/ecosys/v1/ecosys.proto
-source_commit=0d454ce
-proto_sha256=a09d830989898908cd4073c52658acff7aa0302f10f254576618bf27662d7c3b
-# The contract proto is unchanged between 0d454ce and 5594226 (hub HEAD at the
-# time this file was written); verified by `git show <rev>:<path> | sha256sum`.
+source_commit=50d77e8
+proto_sha256=56cdbf19dad7669876a5b5899e4821bf42a328e53c1f8684cd82424d1941d2c2
+# Re-vendored at hub HEAD 50d77e8: the additive ImageFrame/GestureResult/TtsAudio/
+# EnrollRequest/EnrollResponse messages, StreamFrame oneof members 5..10, and
+# StreamOpenRequest.role=3 (the base proto landed in 0d454ce; 50d77e8 is the
+# version-bump commit that carries it). Verified by
+# `git show <rev>:<path> | sha256sum`.
 # The drift test (tests/test_proto_drift.py) re-derives the hash straight from
 # the sibling hub checkout and compares it to the vendored copy.

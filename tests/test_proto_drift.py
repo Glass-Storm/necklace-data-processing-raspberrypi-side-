@@ -80,6 +80,12 @@ def test_generated_stubs_import_and_expose_contract() -> None:
         "video_h264_nal",
         "transcript",
         "result",
+        "image",
+        "gesture",
+        "tts_audio",
+        "enroll_request",
+        "enroll_response",
+        "stream_open",
     ]
     assert [f.name for f in ecosys_pb2.StreamResult.DESCRIPTOR.fields] == [
         "text",
@@ -88,3 +94,52 @@ def test_generated_stubs_import_and_expose_contract() -> None:
     ]
     assert hasattr(ecosys_pb2_grpc, "PairingServiceStub")
     assert hasattr(ecosys_pb2_grpc, "StreamServiceStub")
+
+
+def test_generated_stubs_expose_additive_gesture_contract() -> None:
+    """The regenerated stubs must expose the additive gesture/diarization surface."""
+    from ecosys.v1 import ecosys_pb2
+
+    # The additive messages the hub added for gesture / TTS / enrollment.
+    assert [f.name for f in ecosys_pb2.ImageFrame.DESCRIPTOR.fields] == [
+        "jpeg",
+        "pts_ms",
+        "width",
+        "height",
+    ]
+    assert [f.name for f in ecosys_pb2.GestureResult.DESCRIPTOR.fields] == [
+        "text",
+        "label",
+        "confidence",
+        "pts_ms",
+    ]
+    assert [f.name for f in ecosys_pb2.TtsAudio.DESCRIPTOR.fields] == [
+        "pcm16_16k",
+        "pts_ms",
+    ]
+    assert [f.name for f in ecosys_pb2.EnrollRequest.DESCRIPTOR.fields] == [
+        "name",
+        "audio_pcm16_16k",
+        "pts_ms",
+    ]
+    assert [f.name for f in ecosys_pb2.EnrollResponse.DESCRIPTOR.fields] == [
+        "ok",
+        "reason",
+    ]
+    assert [f.name for f in ecosys_pb2.StreamOpenRequest.DESCRIPTOR.fields] == [
+        "device_id",
+        "kind",
+        "role",
+    ]
+
+    # The new oneof members are strictly additive at field numbers 5..10, so the
+    # frozen members 1..4 keep their numbers (never renumber/reuse).
+    stream_frame = ecosys_pb2.StreamFrame.DESCRIPTOR
+    assert stream_frame.fields_by_name["image"].number == 5
+    assert stream_frame.fields_by_name["gesture"].number == 6
+    assert stream_frame.fields_by_name["tts_audio"].number == 7
+    assert stream_frame.fields_by_name["enroll_request"].number == 8
+    assert stream_frame.fields_by_name["enroll_response"].number == 9
+    assert stream_frame.fields_by_name["stream_open"].number == 10
+    # `role` is the additive field 3 on StreamOpenRequest (fields 1,2 preserved).
+    assert ecosys_pb2.StreamOpenRequest.DESCRIPTOR.fields_by_name["role"].number == 3

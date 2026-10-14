@@ -71,11 +71,15 @@ message HeartbeatResponse {
 
 // StreamService/OpenStream bootstrap frame. Sent by the peer as the first
 // message on the bidi stream so the hub can bind the session to a device.
-// NOTE: this message is part of the frozen contract even though StreamFrame
-// does not (yet) carry it; peers may exchange it over their own side channel.
+// Carried as the `stream_open` StreamFrame oneof member (field 10): with
+// bearer-token auth removed, it is the only thing that tells the hub who is on
+// the other end of a session and how to route frames.
 message StreamOpenRequest {
   string device_id = 1;
   StreamKind kind = 2;
+  // The peer's role, so the hub can route by role (glass vs. daemon/necklace).
+  // Optional; an absent value is DEVICE_ROLE_UNSPECIFIED.
+  DeviceRole role = 3;
 }
 
 // One recognized utterance returned to the peer.
@@ -85,16 +89,71 @@ message StreamResult {
   int64 pts_ms = 3;
 }
 
+// A single JPEG still captured by the necklace camera. The hub DECODES each
+// image to run isolated gesture recognition; it never re-encodes or stores the
+// bytes, and the payload stays opaque to every other layer.
+message ImageFrame {
+  bytes jpeg = 1;
+  int64 pts_ms = 2;
+  int32 width = 3;
+  int32 height = 4;
+}
+
+// One recognized isolated gesture. `label` is the raw recognizer class and
+// `text` is the spoken meaning; the hub emits this toward the glasses.
+message GestureResult {
+  string text = 1;
+  string label = 2;
+  float confidence = 3;
+  int64 pts_ms = 4;
+}
+
+// Hub-synthesized speech as raw little-endian PCM16 mono @ 16 kHz, played by
+// the necklace or the glasses. The hub never sends another sample rate.
+message TtsAudio {
+  bytes pcm16_16k = 1;
+  int64 pts_ms = 2;
+}
+
+// A voiceprint enrollment request from the glasses: a display name plus a raw
+// little-endian PCM16 mono @ 16 kHz sample. Enrollment rides the stream as a
+// frame, so no new RPC (and no token) is introduced.
+message EnrollRequest {
+  string name = 1;
+  bytes audio_pcm16_16k = 2;
+  int64 pts_ms = 3;
+}
+
+// The hub's reply to an EnrollRequest. On rejection `ok` is false and `reason`
+// carries a machine-checkable explanation.
+message EnrollResponse {
+  bool ok = 1;
+  string reason = 2;
+}
+
 // A single frame on the bidirectional stream. Exactly one payload variant is
-// set at a time (oneof). Media payloads are OPAQUE to the hub: audio is raw
-// little-endian PCM16 mono @ 16 kHz, video is raw H.264 NAL units that the
-// phone NEVER decodes or re-encodes.
+// set at a time (oneof).
+//
+// Frame opacity:
+//   * audio (`audio_pcm16_16k`, and `tts_audio.pcm16_16k`) is raw little-endian
+//     PCM16 mono @ 16 kHz that the hub NEVER decodes: it relays the bytes to the
+//     STT engine or to a peer's speaker untouched.
+//   * video (`video_h264_nal`) is an opaque H.264 NAL unit that the phone NEVER
+//     decodes, re-encodes, transcodes, or renders.
+//   * image (`image`) is the one media kind the hub DOES decode, into a bitmap,
+//     solely to run isolated gesture recognition on the still.
 message StreamFrame {
   oneof payload {
     bytes audio_pcm16_16k = 1;
     bytes video_h264_nal = 2;
     string transcript = 3;
     StreamResult result = 4;
+    ImageFrame image = 5;
+    GestureResult gesture = 6;
+    TtsAudio tts_audio = 7;
+    EnrollRequest enroll_request = 8;
+    EnrollResponse enroll_response = 9;
+    StreamOpenRequest stream_open = 10;
   }
 }
 
