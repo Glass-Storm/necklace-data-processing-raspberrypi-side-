@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "Template for the ecosys-pi runtime config file (task 13). Copy it to",
+    "config.json (git-ignored) and edit; NEVER commit real credentials.",
+    "",
+    "Precedence, highest first: real PI_ECOSYS_* env vars > .env > config.json >",
+    "built-in defaults. A blank value is treated as unset and falls through to",
+    "the next layer. Matching is case-insensitive; each key may be spelled with",
+    "its short name (ssid) or its canonical env name (PI_ECOSYS_SSID).",
+    "",
+    "Keys under _comment are documentation only and are ignored by the loader."
+  ],
+  "hub": "192.168.43.1:50051",
+  "tts_lang": "yue",
+  "device_name": "ecosys-pi",
+  "ssid": "ecosys-hotspot",
+  "password": "change-me",
+  "wifi_security": "wpa2",
+  "enrollment_seconds": 8,
+  "hub_port": 50051
+}

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ecosys-pi"
+version = "0.1.0"
+description = "ecosys.v1 gRPC client for the Raspberry Pi camera + audio peer"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "grpcio==1.84.*",
+    "grpcio-tools==1.84.*",
+    "numpy>=2.4.6",
+    "piper-tts>=1.8.0",
+    "protobuf>=7.36.2",
+    "python-dotenv>=1.2.4",
+    "scipy>=1.17.1",
+    "sounddevice>=0.5.6",
+    "zeroconf>=0.151.3",
+]
+
+[project.optional-dependencies]
+pi = ["picamera2"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+# `ecosys_pi` is the hand-written client; `ecosys` is the generated
+# protobuf/gRPC stub package (see scripts/gen_proto.sh). Both live under src/.
+packages = ["src/ecosys_pi", "src/ecosys"]

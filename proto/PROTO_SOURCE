@@ -1,0 +1,22 @@
+# Provenance of the vendored frozen contract: proto/ecosys/v1/ecosys.proto
+#
+# The contract is FROZEN. This file records where the vendored copy came from
+# and its exact content hash. Any regeneration of the gRPC stubs MUST start from
+# this byte-identical file; any change to the contract MUST come from the hub
+# and be re-vendored here (never hand-edited on the Pi).
+#
+# Key=value lines (not INI) so both humans and shell/CI can parse them.
+source_repo=phone-manager
+source_path=contract/src/main/proto/ecosys/v1/ecosys.proto
+source_commit=50d77e8
+proto_sha256=752232a321cc49dfb74d1cb68c7f3de556a800d1b0dc22c8ce6fd15800db6452
+# Re-vendored at hub HEAD 50d77e8: the additive ImageFrame/GestureResult/TtsAudio/
+# EnrollRequest/EnrollResponse messages, StreamFrame oneof members 5..10, and
+# StreamOpenRequest.role=3 (the base proto landed in 0d454ce; 50d77e8 is the
+# version-bump commit that carries it). Verified by
+# `git show <rev>:<path> | sha256sum`.
+# Re-synced once more for the COMMENT-ONLY F2-6 correction: the PairingService and
+# StreamService header comments now state that both are unserved/unauthenticated
+# (no service/rpc or field changed, so the generated stubs are byte-identical).
+# The drift test (tests/test_proto_drift.py) re-derives the hash straight from
+# the sibling hub checkout and compares it to the vendored copy.

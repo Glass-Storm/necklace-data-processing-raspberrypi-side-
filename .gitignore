@@ -1,4 +1,10 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.log
+
+# Task 13: the dotenv / config-file layer holds the hotspot SSID + password.
+# The real files are NEVER committed; config.example.json is the tracked template.
+.env
+config.json
