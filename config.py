@@ -43,9 +43,26 @@ FRAME_INTERVAL_SECONDS = 1.0 / STREAM_FPS
 #            best of all modes in live testing: one detection on the full
 #            frame, no re-detection flicker on the hub, ~50x less bandwidth.
 #   "off"  - full frames are streamed. Aiming/mounting mode only; opt-in.
-# Unknown values fall back to "landmarks" (privacy-max default, checked at
-# startup).
-PRIVACY_MODE = os.environ.get("PI_NODE_PRIVACY", "landmarks").strip().lower()
+# Unknown values fall back to "landmarks" (the privacy-max default).
+PRIVACY_MODES = ("landmarks", "crop", "segment", "off")
+
+
+def _normalize_privacy_mode(raw: str) -> str:
+    """Return a known privacy mode, defaulting to the privacy-max one.
+
+    A typo must never silently select a mode that transmits more than the
+    operator asked for, so anything unrecognised becomes "landmarks".
+    """
+    mode = raw.strip().lower()
+    if mode not in PRIVACY_MODES:
+        print(f"[Pi Privacy] Unknown PI_NODE_PRIVACY='{mode}', using 'landmarks'.")
+        return "landmarks"
+    return mode
+
+
+PRIVACY_MODE = _normalize_privacy_mode(
+    os.environ.get("PI_NODE_PRIVACY", "landmarks")
+)
 
 # Selfie segmentation model for the 'segment' mode (segmenter.py). ~250 KB.
 SEGMENTER_MODEL_PATH = os.environ.get(

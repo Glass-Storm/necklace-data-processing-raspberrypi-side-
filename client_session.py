@@ -11,7 +11,13 @@ import threading
 import time
 
 from audio_output import play_speech_audio
-from config import DEFAULT_SAMPLE_RATE, DEVICE_ID, FRAME_INTERVAL_SECONDS, PORT
+from config import (
+    DEFAULT_SAMPLE_RATE,
+    DEVICE_ID,
+    FRAME_INTERVAL_SECONDS,
+    PORT,
+    PRIVACY_MODE,
+)
 from video_stream import NO_HAND_MESSAGE_TYPE, VIDEO_MESSAGE_TYPE, VideoStream
 from video_stream import HAND_LANDMARKS_MESSAGE_TYPE
 
@@ -288,6 +294,19 @@ class ClientSession:
             time.sleep(HOLD_HEARTBEAT_SECONDS)
 
     def _send_frame(self, encoded_image: str) -> bool:
+        """Send one JPEG frame. Refused outright in landmarks mode.
+
+        Last line of defence: landmarks mode promises that no image ever
+        leaves the device, so a video frame reaching this method means a bug
+        upstream. Drop it and send a no_hand marker rather than transmit it.
+        """
+        if PRIVACY_MODE == "landmarks":
+            print(
+                "[Pi Privacy] BLOCKED a video frame in landmarks mode; "
+                "sending no_hand instead. No image data was transmitted."
+            )
+            return self._send_no_hand()
+
         payload = json.dumps(
             {
                 "type": VIDEO_MESSAGE_TYPE,

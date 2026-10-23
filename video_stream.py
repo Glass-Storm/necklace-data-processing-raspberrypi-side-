@@ -1,14 +1,14 @@
 """Webcam capture, privacy crop and JPEG encoding for the phone stream.
 
-In the default privacy mode (``PI_NODE_PRIVACY=crop``) every captured frame
-first runs through the hand detector and only a crop around the detected hand
-is encoded and returned — the full frame never leaves this class. When no
-hand is present the caller receives a no-hand marker instead of an image, so
-nothing observable about the scene is transmitted at all.
+In the default privacy mode (``PI_NODE_PRIVACY=landmarks``) no image data
+leaves this device at all: hand landmarks are detected on the full frame and
+only the 21 (x, y, z) coordinates are returned for transmission. The frame
+itself is never encoded.
 
-``PI_NODE_PRIVACY=off`` disables the crop and streams full frames. That mode
-exists only for aiming the camera during mounting and must never be the
-default.
+``PI_NODE_PRIVACY=crop`` sends only a crop around the detected hand,
+``segment`` sends the frame with the scene blacked out, and ``off`` streams
+full frames. That last mode exists only for aiming the camera during
+mounting and must never be the default.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import cv2
 from config import (
     CAMERA_INDEX,
     CAMERA_SOURCE,
-    CROP_MARGIN,
     DETECT_EVERY_N_FRAMES,
     FRAME_HEIGHT,
     FRAME_WIDTH,
@@ -40,6 +39,7 @@ HAND_LANDMARKS_MESSAGE_TYPE = "hand_landmarks"
 # ~0.03 px at 320 wide, far below landmark noise, and it roughly halves the
 # JSON payload (~500 B/frame vs ~1 KB unrounded).
 LANDMARK_DECIMALS = 4
+
 
 @dataclass
 class CapturedFrame:
@@ -60,7 +60,7 @@ class CapturedFrame:
 
 
 class VideoStream:
-    """Wraps a single OpenCV capture device and the privacy crop."""
+    """Wraps a single OpenCV capture device and the privacy pipeline."""
 
     def __init__(
         self,
@@ -76,7 +76,21 @@ class VideoStream:
     ) -> None:
         self._detector = detector
         self._segmenter = segmenter
-        self._send_landmarks = detector is not None and PRIVACY_MODE == "landmarks"
+
+        # The mode is resolved once, here, and every pipeline below consults
+        # it: a stream built in "landmarks" mode is structurally incapable of
+        # encoding an image, whatever is passed in for detector/segmenter.
+        self._privacy_mode = PRIVACY_MODE
+        self._send_landmarks = PRIVACY_MODE == "landmarks"
+        if self._send_landmarks and detector is None:
+            # Fail loud at construction. Falling through to a later branch
+            # would encode a full frame, which is exactly what this mode
+            # exists to prevent.
+            raise ValueError(
+                "PRIVACY_MODE=landmarks requires a hand detector; "
+                "refusing to build a stream that could send images."
+            )
+
         self._camera_index = camera_index
         self._camera_source = camera_source
         self._width = width
@@ -110,12 +124,16 @@ class VideoStream:
 
         self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
         self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
-        if self._segmenter is not None:
+        if self._send_landmarks:
+            mode = "landmarks only, no image"
+        elif self._privacy_mode == "segment":
             mode = "background removal"
-        elif self._detector is not None:
+        elif self._privacy_mode == "off":
+            mode = "full frame"
+        elif self._privacy_mode == "crop":
             mode = "privacy crop"
         else:
-            mode = "full frame"
+            raise ValueError(f"Unknown PRIVACY_MODE {self._privacy_mode!r}")
         print(
             f"[Pi Camera] Opened source {source!r} "
             f"at {self._width}x{self._height} ({mode})"
@@ -123,11 +141,10 @@ class VideoStream:
         return True
 
     def read_encoded_frame(self) -> CapturedFrame | None:
-        """Grab one frame and return it base64 encoded, or None on failure.
+        """Grab one frame and return the next unit for the phone.
 
-        Returns a CapturedFrame rather than a bare string now: the caller
-        needs to know whether the payload is an image or a no-hand marker,
-        and the type field carries that without a second channel.
+        In landmarks mode the result never carries an image: only the 21
+        landmark coordinates, or a no-hand marker.
         """
         if self._capture is None:
             return None
@@ -138,19 +155,36 @@ class VideoStream:
 
         resized = cv2.resize(frame, (self._width, self._height))
 
-        if self._segmenter is not None:
+        # Landmarks mode first and unconditionally: no branch below it can
+        # run, so no image is ever encoded and the full frame stays in memory
+        # until this call returns.
+        if self._send_landmarks:
+            return self._landmark_pipeline(resized)
+
+        if self._privacy_mode == "segment":
+            if self._segmenter is None:
+                # Segment mode without a segmenter must not fall through to
+                # the full frame: send a marker instead.
+                print("[Pi Camera] No segmenter in segment mode; sending no-hand marker.")
+                return CapturedFrame(message_type=NO_HAND_MESSAGE_TYPE)
             # Segment mode: the full frame, scene removed. The wrist and the
             # hand's natural scale are preserved, which live testing showed
             # the hub's detector prefers over re-framed crops.
             cleaned = self._segmenter.apply(resized)
-            return self._encode(cleaned, VIDEO_MESSAGE_TYPE)
+            encoded = self._encode(cleaned, VIDEO_MESSAGE_TYPE)
+            return encoded if encoded is not None else CapturedFrame(
+                message_type=NO_HAND_MESSAGE_TYPE
+            )
 
-        if self._send_landmarks:
-            return self._landmark_pipeline(resized)
+        if self._privacy_mode == "off":
+            # Aiming mode, opt-in only: the full frame is the payload.
+            return self._encode(resized, VIDEO_MESSAGE_TYPE)
 
         if self._detector is None:
-            # Aiming mode: no detector configured, full frame is the payload.
-            return self._encode(resized, VIDEO_MESSAGE_TYPE)
+            # A crop-mode stream without a detector cannot produce a crop.
+            # Never fall back to the full frame: send a no-hand marker.
+            print("[Pi Camera] No detector in crop mode; sending no-hand marker.")
+            return CapturedFrame(message_type=NO_HAND_MESSAGE_TYPE)
 
         return self._crop_pipeline(resized)
 
@@ -159,21 +193,25 @@ class VideoStream:
     # -------------------------------------------------------------------
 
     def _landmark_pipeline(self, frame) -> CapturedFrame:
-        """Detect landmarks on the full frame; send coordinates only."""
+        """Detect landmarks on the full frame; return coordinates only."""
         points, handedness = self._detector.detect_landmarks(frame)
 
         if points is None:
             # Detection lost the hand. Hold the last landmarks for the grace
             # period so the phone's skeleton does not flicker on a single
-            # dropped detection — same policy as crop mode.
+            # dropped detection -- same policy as crop mode.
             self._frames_since_hand += 1
-            if self._last_landmarks is not None and self._frames_since_hand <= self._grace_frames:
+            if (
+                self._last_landmarks is not None
+                and self._frames_since_hand <= self._grace_frames
+            ):
                 return CapturedFrame(
                     message_type=HAND_LANDMARKS_MESSAGE_TYPE,
                     landmarks=self._last_landmarks,
                     handedness=self._last_handedness,
                 )
             self._last_landmarks = None
+            self._last_handedness = None
             return CapturedFrame(message_type=NO_HAND_MESSAGE_TYPE)
 
         self._frames_since_hand = 0
@@ -224,13 +262,16 @@ class VideoStream:
         self._last_bbox = None
         return CapturedFrame(message_type=NO_HAND_MESSAGE_TYPE)
 
-    def _crop_and_encode(self, frame, bbox: BoundingBox) -> CapturedFrame | None:
+    def _crop_and_encode(self, frame, bbox: BoundingBox) -> CapturedFrame:
         """Slice the hand crop out of [frame] and JPEG-encode it."""
         crop = frame[bbox.y0:bbox.y1, bbox.x0:bbox.x1]
         if crop.size == 0:
             print("[Pi Camera] Crop was empty, sending no-hand marker.")
             return CapturedFrame(message_type=NO_HAND_MESSAGE_TYPE)
-        return self._encode(crop, VIDEO_MESSAGE_TYPE)
+        encoded = self._encode(crop, VIDEO_MESSAGE_TYPE)
+        if encoded is None:
+            return CapturedFrame(message_type=NO_HAND_MESSAGE_TYPE)
+        return encoded
 
     def _encode(self, image, message_type: str) -> CapturedFrame | None:
         """JPEG-encode [image] to base64. None on an encoding failure."""
@@ -249,3 +290,4 @@ class VideoStream:
         if self._capture is not None:
             self._capture.release()
             self._capture = None
+

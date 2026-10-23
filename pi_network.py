@@ -39,12 +39,11 @@ def create_detector() -> HandDetector | None:
     """
     if PRIVACY_MODE == "off":
         print("[Pi Privacy] Crop mode OFF — full frames will be streamed.")
-        print("[Pi Privacy] Aiming mode only. Re-enable with PI_NODE_PRIVACY=crop.")
+        print("[Pi Privacy] Aiming mode only. Re-enable with PI_NODE_PRIVACY=landmarks.")
         return None
 
-    if PRIVACY_MODE not in ("crop", "landmarks"):
-        print(f"[Pi Privacy] Unknown PI_NODE_PRIVACY='{PRIVACY_MODE}', using 'landmarks'.")
-
+    # PRIVACY_MODE is normalised in config, so it is always one of
+    # config.PRIVACY_MODES here.
     try:
         detector = build_hand_detector()
     except (FileNotFoundError, RuntimeError) as exc:

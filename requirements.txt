@@ -24,3 +24,10 @@ numpy>=1.24
 # Speaker playback (audio_output.py). Also needs the system PortAudio
 # library: sudo apt install libportaudio2
 sounddevice>=0.4.6
+
+# BLE peripheral mode for Wi-Fi onboarding (setup_network.py).
+# "bleak" is central-only: it can scan for and connect to devices, but has no
+# peripheral/GATT-server support, so "from bleak import BleakPeripheral" fails.
+# "bless" wraps the BlueZ D-Bus API to expose a GATT server from Python.
+# Requires bluetoothd and an unblocked adapter: sudo rfkill unblock bluetooth
+bless>=0.2.6
