@@ -8,7 +8,7 @@ client can dial, with a documented precedence:
 2. otherwise ``PI_ECOSYS_HUB`` from the environment;
 3. otherwise the default gateway
    (:func:`ecosys_pi.network.detect_default_gateway`) combined with the
-   configured ``hub_port`` (``PI_ECOSYS_HUB_PORT``, default ``50051``).
+   configured ``hub_port`` (``PI_ECOSYS_HUB_PORT``, default ``9000``).
 
 There is **no mDNS**: discovery is gateway-only. Steps 1-2 are the escape hatch
 for tests and hosts where the hub is not the gateway - notably this repo's E2E

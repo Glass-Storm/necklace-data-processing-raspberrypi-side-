@@ -14,7 +14,7 @@ import pytest
 from ecosys_pi import discovery
 from ecosys_pi.discovery import ENV_HUB, HubNotFoundError, resolve_hub
 
-TARGET = "192.168.43.1:50051"
+TARGET = "192.168.43.1:9000"
 GATEWAY = "192.168.43.1"
 
 
@@ -61,7 +61,7 @@ def test_blank_override_and_env_are_treated_as_unset(blank: str) -> None:
 
 
 def test_gateway_host_with_default_port() -> None:
-    """A detected default gateway yields ``gateway:50051`` by default."""
+    """A detected default gateway yields ``gateway:9000`` by default."""
     assert resolve_hub(environ={}, detect_gateway=lambda: GATEWAY) == TARGET
 
 
@@ -121,7 +121,7 @@ def test_cli_seam_uses_the_discovered_hub_without_pairing(
 
     calls: list[str | None] = []
 
-    def resolve(override, *, environ, port=50051):
+    def resolve(override, *, environ, port=9000):
         calls.append(override)
         return "127.0.0.1:1"
 

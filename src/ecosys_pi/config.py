@@ -36,7 +36,7 @@ Setting                   Canonical env var             Default
 ``ssid``                  ``PI_ECOSYS_SSID``            *(unset)*
 ``password``              ``PI_ECOSYS_HOTSPOT_PASSWORD``*(unset)*
 ``enrollment_seconds``    ``PI_ECOSYS_ENROLLMENT_SECONDS``      ``8``
-``hub_port``              ``PI_ECOSYS_HUB_PORT``        ``50051``
+``hub_port``              ``PI_ECOSYS_HUB_PORT``        ``9000``
 ========================  ============================  ==========================
 
 Inside a ``.env`` or ``config.json`` file a setting may be spelled either with
@@ -92,7 +92,7 @@ DEFAULT_TTS_LANG: str = "yue"
 DEFAULT_ENROLLMENT_SECONDS: int = 8
 
 #: Default hub gRPC port, used when only the gateway host is known.
-DEFAULT_HUB_PORT: int = 50051
+DEFAULT_HUB_PORT: int = 9000
 
 #: Wi-Fi security modes ``nmcli`` may join. Mirrors
 #: :data:`ecosys_pi.network.SUPPORTED_SECURITY`.

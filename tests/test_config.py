@@ -167,7 +167,7 @@ def test_new_fields_have_documented_defaults(
     assert cfg.password is None
     assert cfg.wifi_security == DEFAULT_WIFI_SECURITY == "wpa2"
     assert cfg.enrollment_seconds == DEFAULT_ENROLLMENT_SECONDS == 8
-    assert cfg.hub_port == DEFAULT_HUB_PORT == 50051
+    assert cfg.hub_port == DEFAULT_HUB_PORT == 9000
 
 
 def test_config_file_values_are_loaded(tmp_path: Path) -> None:

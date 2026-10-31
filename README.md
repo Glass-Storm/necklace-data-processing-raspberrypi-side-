@@ -121,7 +121,7 @@ uv run python -m ecosys_pi --help         # the CLI
 uv run python -m ecosys_pi
 
 # Scripted: explicit hub, microphone audio only (explicit opt-in), 100 frames.
-uv run python -m ecosys_pi --hub 192.168.43.1:50051 --mode audio --enable-audio --frames 100
+uv run python -m ecosys_pi --hub 192.168.43.1:9000 --mode audio --enable-audio --frames 100
 ```
 
 ### CLI flags
@@ -152,7 +152,7 @@ are frozen. Informational chatter from the media/playback modules goes to
 | `PI_ECOSYS_HUB`                | (unset)                | `HOST:PORT` hub override. Precedence: `--hub` > `PI_ECOSYS_HUB` > default gateway. Blank = unset. |
 | `PI_ECOSYS_SSID`               | (unset)                | Hotspot SSID the Pi joins with `nmcli`.                                                           |
 | `PI_ECOSYS_HOTSPOT_PASSWORD`   | (unset)                | Hotspot WPA2/WPA3 password. A secret: redacted in `Config.__repr__`.                              |
-| `PI_ECOSYS_HUB_PORT`           | `50051`                | Hub gRPC port appended to the gateway host.                                                       |
+| `PI_ECOSYS_HUB_PORT`           | `9000`                 | Hub gRPC port appended to the gateway host.                                                       |
 | `PI_ECOSYS_WIFI_SECURITY`      | `wpa2`                 | `nmcli` key management: `wpa2` or `wpa3` (SAE).                                                   |
 | `PI_ECOSYS_ENABLE_AUDIO`       | (unset)                | Truthy (`1`/`true`/`yes`/`on`) opts into microphone upload; otherwise the necklace is video-only. |
 | `PI_ECOSYS_ENROLLMENT_SECONDS` | `8`                    | Voiceprint enrollment length (informational on the Pi).                                           |

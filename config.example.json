@@ -10,12 +10,12 @@
     "",
     "Keys under _comment are documentation only and are ignored by the loader."
   ],
-  "hub": "192.168.43.1:50051",
+  "hub": "192.168.43.1:9000",
   "tts_lang": "yue",
   "device_name": "ecosys-pi",
   "ssid": "ecosys-hotspot",
   "password": "change-me",
   "wifi_security": "wpa2",
   "enrollment_seconds": 8,
-  "hub_port": 50051
+  "hub_port": 9000
 }

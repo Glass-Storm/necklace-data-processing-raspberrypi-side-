@@ -8,3 +8,5 @@ __pycache__/
 # The real files are NEVER committed; config.example.json is the tracked template.
 .env
 config.json
+
+.omo/
