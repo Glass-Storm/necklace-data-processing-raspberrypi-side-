@@ -362,10 +362,20 @@ def test_select_audio_source_env_synthetic() -> None:
     )
 
 
-def test_select_audio_source_falls_back_without_hardware() -> None:
-    from ecosys_pi.audio import select_audio_source
+def test_select_audio_source_falls_back_without_hardware(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host with no PortAudio and no ``arecord`` must select synthetic.
 
-    source = select_audio_source({})
+    The probes are patched out so the assertion is hermetic: a real Pi has
+    ``arecord`` installed (alsa-utils) and must NOT be treated as "absent
+    hardware" just because this is a unit test.
+    """
+    from ecosys_pi import audio
+
+    monkeypatch.setattr(audio, "sounddevice_available", lambda: False)
+    monkeypatch.setattr(audio.shutil, "which", lambda _name: None)
+    source = audio.select_audio_source({})
     assert isinstance(source, SyntheticAudioSource)
     assert source.open() is True
     assert source.read_frame() == synthetic_audio_frame(0)
