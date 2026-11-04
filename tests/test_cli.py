@@ -426,5 +426,57 @@ def test_blank_config_file_values_fall_through_to_env(tmp_path, monkeypatch) -> 
     assert config.tts_lang == "yue"
 
 
+def test_session_binds_the_configured_device_name(monkeypatch) -> None:
+    """``cfg.device_name`` reaches the session so ``stream_open`` declares it."""
+    seen: dict[str, object] = {}
+
+    async def fake_session(hub, **kwargs):
+        seen["hub"] = hub
+        seen.update(kwargs)
+        return cli.EXIT_OK
+
+    monkeypatch.setattr(cli, "_run_session", fake_session)
+
+    rc = cli.main(
+        ["--hub", "127.0.0.1:9000", "--frames", "0"],
+        environ={"PI_ECOSYS_DEVICE_NAME": "necklace-7"},
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert rc == cli.EXIT_OK
+    assert seen["device_id"] == "necklace-7"
+
+
+def test_session_falls_back_to_the_default_device_id(monkeypatch) -> None:
+    """A blank configured name still binds the stable ``ecosys-pi`` id."""
+    from ecosys_pi.config import Config
+
+    seen: dict[str, object] = {}
+
+    async def fake_session(hub, **kwargs):
+        seen.update(kwargs)
+        return cli.EXIT_OK
+
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda *args, **kwargs: Config(
+            hub="127.0.0.1:9000", tts_lang="yue", device_name=""
+        ),
+    )
+    monkeypatch.setattr(cli, "_run_session", fake_session)
+
+    rc = cli.main(
+        ["--frames", "0"],
+        environ={"PI_ECOSYS_DEVICE_NAME": "   "},
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert rc == cli.EXIT_OK
+    assert seen["device_id"] == "ecosys-pi"
+
+
 if __name__ == "__main__":  # pragma: no cover - manual invocation
     pytest.main([__file__])

@@ -67,6 +67,9 @@ STDOUT_CONTRACT = (
 #: Pace for the video pump: one JPEG still per capture frame (10 fps).
 _VIDEO_FRAME_INTERVAL_S = 0.1
 
+#: Device id the ``stream_open`` binds when the config yields no name.
+DEVICE_NAME_FALLBACK = "ecosys-pi"
+
 #: Environment variable that explicitly opts the necklace into microphone upload.
 ENABLE_AUDIO_ENV = "PI_ECOSYS_ENABLE_AUDIO"
 
@@ -195,6 +198,7 @@ def _dispatch(
                 mode=args.mode,
                 frames=args.frames,
                 enable_audio=args.enable_audio or audio_opted_in(env),
+                device_id=cfg.device_name or DEVICE_NAME_FALLBACK,
                 env=env,
                 out=out,
                 err=err,
@@ -211,6 +215,7 @@ async def _run_session(
     mode: str,
     frames: int,
     enable_audio: bool,
+    device_id: str,
     env: Mapping[str, str],
     out: IO[str],
     err: IO[str],
@@ -222,6 +227,8 @@ async def _run_session(
     mic audio by accident.
     """
     from grpc import aio
+
+    from ecosys.v1 import ecosys_pb2
 
     from ecosys_pi.audio import (
         AudioProducer,
@@ -278,6 +285,8 @@ async def _run_session(
             on_transcript,
             on_tts_audio=on_tts_audio,
             on_gesture=on_gesture,
+            device_id=device_id,
+            role=ecosys_pb2.DEVICE_ROLE_DAEMON,
         )
 
         stream_task = asyncio.create_task(client.run(), name="ecosys-cli-stream")

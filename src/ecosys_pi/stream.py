@@ -24,6 +24,8 @@ Hard rules (frozen protocol):
 * the stream is opened UNAUTHENTICATED by default: ``token=None`` sends NO
   ``authorization`` metadata (pairing/PIN were removed from the runtime). When a
   token IS supplied it is reused across a transport drop;
+* the FIRST frame on EVERY call is a ``stream_open`` binding ``{device_id,
+  role}``, written before any queued media frame, so the hub routes by role;
 * ``UNAUTHENTICATED`` raises :class:`UnauthenticatedError` and is never retried.
 
 The caller owns the channel; this client never closes it.
@@ -49,6 +51,8 @@ _LOG = logging.getLogger(__name__)
 DEFAULT_QUEUE_MAXSIZE: Final = 64
 #: Maximum reconnect attempts after a transport drop before giving up.
 DEFAULT_MAX_RECONNECTS: Final = 5
+#: Device id bound by the ``stream_open`` bootstrap when the caller omits one.
+DEFAULT_DEVICE_ID: Final = "ecosys-pi"
 #: Base seconds for the linear reconnect backoff (multiplied by the attempt).
 DEFAULT_RECONNECT_BACKOFF: Final = 0.25
 #: Seconds to keep draining hub frames after the writer half-closes.
@@ -110,6 +114,8 @@ class StreamClient:
         on_tts_audio: TtsAudioCallback | None = None,
         on_gesture: GestureCallback | None = None,
         on_speaker_label: SpeakerLabelCallback | None = None,
+        device_id: str = DEFAULT_DEVICE_ID,
+        role: int = ecosys_pb2.DEVICE_ROLE_DAEMON,
         queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
         max_reconnects: int = DEFAULT_MAX_RECONNECTS,
         reconnect_backoff: float = DEFAULT_RECONNECT_BACKOFF,
@@ -117,6 +123,8 @@ class StreamClient:
     ) -> None:
         if token is not None and not token:
             raise ValueError("token must be a non-empty string or None")
+        if not device_id.strip():
+            raise ValueError("device_id must be a non-empty string")
         if queue_maxsize < 1:
             raise ValueError("queue_maxsize must be >= 1")
 
@@ -125,6 +133,9 @@ class StreamClient:
         # when supplied, is cached for the whole client lifetime; a transport
         # drop reconnects with THIS token.
         self._token = token
+        # The identity bound by the leading ``stream_open`` on every call.
+        self._device_id = device_id
+        self._role = role
         self._on_transcript = on_transcript
         # Optional per-payload callbacks: an unset one simply drops its frame.
         self._on_tts_audio = on_tts_audio
@@ -154,7 +165,7 @@ class StreamClient:
 
     @property
     def written_frames(self) -> int:
-        """Frames successfully handed to ``write()``."""
+        """Media frames handed to ``write()``; the bootstrap bind is not counted."""
         return self._written_frames
 
     @property
@@ -247,6 +258,15 @@ class StreamClient:
             metadata=((AUTHORIZATION_HEADER, f"Bearer {self._token}"),)
         )
 
+    def _open_frame(self) -> ecosys_pb2.StreamFrame:
+        """Build the bootstrap frame that binds this session's identity."""
+        return ecosys_pb2.StreamFrame(
+            stream_open=ecosys_pb2.StreamOpenRequest(
+                device_id=self._device_id,
+                role=self._role,
+            )
+        )
+
     async def _run_connection(self) -> None:
         """Run one connection's writer+reader until one side stops."""
         call = self._open_call()
@@ -289,6 +309,12 @@ class StreamClient:
             self._call = None
 
     async def _writer_loop(self, call: aio.StreamStreamCall) -> None:
+        # Bind the session BEFORE draining anything: the hub routes by the role
+        # declared here, and a reconnect must re-bind on its fresh call too.
+        try:
+            await call.write(self._open_frame())
+        except aio.AioRpcError as exc:
+            raise _classify(exc) from exc
         while True:
             try:
                 frame = self._queue.get_nowait()

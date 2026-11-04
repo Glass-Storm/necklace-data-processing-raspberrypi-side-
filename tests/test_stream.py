@@ -87,6 +87,12 @@ class FakeHub(ecosys_pb2_grpc.StreamServiceServicer):
 
         self.call_count = 0
         self.metadata_seen: list[dict[str, str]] = []
+        #: Every frame the hub received, in wire order, across all calls.
+        self.frames: list[ecosys_pb2.StreamFrame] = []
+        #: Frames per call (index 0 = the first call), so a reconnect can be
+        #: proven to re-send its bootstrap frame first.
+        self.call_frames: list[list[ecosys_pb2.StreamFrame]] = []
+        #: Media frames only: the `stream_open` bootstrap is not media.
         self.received_frames = 0
         self.transcripts_sent = 0
         self.stream_ended = False
@@ -95,6 +101,7 @@ class FakeHub(ecosys_pb2_grpc.StreamServiceServicer):
     async def OpenStream(self, request_iterator, context):
         self.call_count += 1
         call_index = self.call_count
+        self.call_frames.append([])
         md = dict(context.invocation_metadata())
         self.metadata_seen.append(md)
 
@@ -116,6 +123,10 @@ class FakeHub(ecosys_pb2_grpc.StreamServiceServicer):
                 self.stall_seen.set()
                 await self.stall_event.wait()
             async for frame in request_iterator:
+                self.frames.append(frame)
+                self.call_frames[call_index - 1].append(frame)
+                if frame.WhichOneof("payload") == "stream_open":
+                    continue
                 self.received_frames += 1
                 if self.transcript_on_audio and frame.HasField("audio_pcm16_16k"):
                     self.transcripts_sent += 1
@@ -554,5 +565,86 @@ def test_result_frame_without_a_speaker_label_skips_the_label_callback() -> None
     asyncio.run(
         asyncio.wait_for(
             _scenario_result_without_speaker_skips_label(), timeout=TIMEOUT
+        )
+    )
+
+
+async def _scenario_stream_open_is_the_first_frame() -> None:
+    hub = FakeHub()
+    server, target = await _start_hub(hub)
+    channel = aio.insecure_channel(target)
+
+    try:
+        client = StreamClient(
+            channel,
+            TOKEN,
+            lambda _t: None,
+            device_id="ecosys-pi-test",
+            role=ecosys_pb2.DEVICE_ROLE_DAEMON,
+        )
+        # Queue the media frame BEFORE the call opens: the bind must still win.
+        await client.send(_audio_frame(0))
+        run_task = asyncio.create_task(client.run())
+        await _wait_until(lambda: len(hub.frames) >= 2)
+
+        client.close()
+        await asyncio.wait_for(run_task, timeout=TIMEOUT)
+
+        first = hub.frames[0]
+        assert first.WhichOneof("payload") == "stream_open"
+        assert first.stream_open.device_id == "ecosys-pi-test"
+        assert first.stream_open.role == ecosys_pb2.DEVICE_ROLE_DAEMON
+        # The media frame queued BEFORE the call was opened follows the bind.
+        assert hub.frames[1].WhichOneof("payload") == "audio_pcm16_16k"
+    finally:
+        await channel.close()
+        await _stop_hub(server)
+
+
+def test_stream_open_is_the_first_frame_of_the_call() -> None:
+    """The bootstrap `stream_open` bind precedes every media frame."""
+    asyncio.run(
+        asyncio.wait_for(_scenario_stream_open_is_the_first_frame(), timeout=TIMEOUT)
+    )
+
+
+async def _scenario_reconnect_resends_stream_open_first() -> None:
+    hub = FakeHub(abort_calls={1: grpc.StatusCode.UNAVAILABLE})
+    server, target = await _start_hub(hub)
+    channel = aio.insecure_channel(target)
+
+    try:
+        client = StreamClient(
+            channel,
+            TOKEN,
+            lambda _t: None,
+            device_id="ecosys-pi-test",
+            role=ecosys_pb2.DEVICE_ROLE_DAEMON,
+            max_reconnects=3,
+            reconnect_backoff=0.05,
+        )
+        run_task = asyncio.create_task(client.run())
+        await _wait_until(lambda: hub.call_count >= 2)
+
+        await client.send(_audio_frame(0))
+        await _wait_until(lambda: len(hub.call_frames[1]) >= 2)
+
+        client.close()
+        await asyncio.wait_for(run_task, timeout=TIMEOUT)
+
+        first = hub.call_frames[1][0]
+        assert first.WhichOneof("payload") == "stream_open"
+        assert first.stream_open.device_id == "ecosys-pi-test"
+        assert first.stream_open.role == ecosys_pb2.DEVICE_ROLE_DAEMON
+    finally:
+        await channel.close()
+        await _stop_hub(server)
+
+
+def test_reconnect_resends_stream_open_before_media() -> None:
+    """Every reconnect re-binds the session with a leading `stream_open`."""
+    asyncio.run(
+        asyncio.wait_for(
+            _scenario_reconnect_resends_stream_open_first(), timeout=TIMEOUT
         )
     )
