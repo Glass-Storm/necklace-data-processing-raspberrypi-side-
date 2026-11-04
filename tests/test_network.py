@@ -185,6 +185,37 @@ def test_parse_default_gateway_handles_ipv6() -> None:
     assert parse_default_gateway("default via fe80::1 dev wlan0\n") == "fe80::1"
 
 
+def test_parse_default_gateway_filters_by_interface_and_exclusion() -> None:
+    """The parser honours the preferred interface and excludes management links."""
+    routes = (
+        "default via 10.55.0.1 dev usb0 proto dhcp metric 100\n"
+        "default via 192.168.43.1 dev wlan0 proto dhcp metric 600\n"
+    )
+
+    assert parse_default_gateway(routes, interface="wlan0") == "192.168.43.1"
+    assert (
+        parse_default_gateway(routes, excluded_interfaces=("usb0", "eth0"))
+        == "192.168.43.1"
+    )
+    assert parse_default_gateway(routes, interface="usb1") is None
+
+
+def test_parse_default_gateway_filters_nmcli_by_device() -> None:
+    """The nmcli block carries GENERAL.DEVICE, so management links are skipped."""
+    output = (
+        "GENERAL.DEVICE:usb0\n"
+        "IP4.GATEWAY:10.55.0.1\n"
+        "GENERAL.DEVICE:wlan0\n"
+        "IP4.GATEWAY:192.168.43.1\n"
+    )
+
+    assert parse_default_gateway(output, interface="wlan0") == "192.168.43.1"
+    assert (
+        parse_default_gateway(output, excluded_interfaces=("usb0", "eth0"))
+        == "192.168.43.1"
+    )
+
+
 def test_parse_default_gateway_returns_none_without_a_default_route() -> None:
     assert parse_default_gateway("") is None
     assert (
@@ -235,6 +266,38 @@ def test_detect_default_gateway_skips_commands_that_fail() -> None:
 
 def test_detect_default_gateway_returns_none_when_nothing_answers() -> None:
     runner = FakeRunner(default=_result(returncode=1))
+
+    assert detect_default_gateway(runner=runner) is None
+
+
+def test_detect_default_gateway_prefers_wlan0_over_the_usb0_management_route() -> None:
+    """With usb0 first and wlan0 second, the phone (wlan0) gateway wins."""
+    routes = (
+        "default via 10.55.0.1 dev usb0 proto dhcp metric 100\n"
+        "default via 192.168.43.1 dev wlan0 proto dhcp metric 600\n"
+    )
+    runner = FakeRunner(default=_result(stdout=routes))
+
+    gateway = detect_default_gateway(preferred_interface="wlan0", runner=runner)
+
+    assert gateway == "192.168.43.1"
+    assert runner.calls[0] == [
+        "ip",
+        "route",
+        "show",
+        "default",
+        "dev",
+        "wlan0",
+    ], "the preferred interface must be probed before the general fallback"
+
+
+@pytest.mark.parametrize("management_interface", ["usb0", "eth0"])
+def test_detect_default_gateway_ignores_management_links(
+    management_interface: str,
+) -> None:
+    """A usb0/eth0 default route is never mistaken for the phone hotspot."""
+    routes = f"default via 10.55.0.1 dev {management_interface} proto dhcp metric 100\n"
+    runner = FakeRunner(default=_result(stdout=routes))
 
     assert detect_default_gateway(runner=runner) is None
 

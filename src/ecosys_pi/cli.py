@@ -45,7 +45,7 @@ import logging
 import os
 import sys
 import time
-from typing import IO, Mapping, Sequence
+from typing import IO, Callable, Mapping, Sequence
 
 from ecosys_pi.config import load_config
 
@@ -66,6 +66,12 @@ STDOUT_CONTRACT = (
 
 #: Pace for the video pump: one JPEG still per capture frame (10 fps).
 _VIDEO_FRAME_INTERVAL_S = 0.1
+
+#: How long to retry gateway discovery after a hotspot join (DHCP/association lag).
+GATEWAY_RETRY_TIMEOUT_S = 30.0
+
+#: Pause between gateway-discovery retries.
+GATEWAY_RETRY_INTERVAL_S = 2.0
 
 #: Device id the ``stream_open`` binds when the config yields no name.
 DEVICE_NAME_FALLBACK = "ecosys-pi"
@@ -155,6 +161,38 @@ def main(
         return _dispatch(args, environ, out, err)
 
 
+def _resolve_hub_with_retry(
+    *,
+    override: str | None,
+    environ: Mapping[str, str],
+    port: int,
+    timeout_s: float,
+    interval_s: float = GATEWAY_RETRY_INTERVAL_S,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> str:
+    """Resolve the hub, retrying a missing gateway until ``timeout_s`` elapses.
+
+    Right after a hotspot join the association/DHCP lease can take several
+    seconds, so the default route is briefly absent. Every other discovery
+    failure mode (an override or ``PI_ECOSYS_HUB``) never reaches here.
+    """
+    from ecosys_pi.discovery import HubNotFoundError, resolve_hub
+
+    now = time.monotonic if clock is None else clock
+    wait = time.sleep if sleep is None else sleep
+    deadline = now() + timeout_s
+    while True:
+        try:
+            return resolve_hub(override, environ=environ, port=port)
+        except HubNotFoundError:
+            current = now()
+            if current >= deadline:
+                raise
+            remaining = deadline - current
+            wait(remaining if remaining < interval_s else interval_s)
+
+
 def _dispatch(
     args: argparse.Namespace,
     environ: Mapping[str, str] | None,
@@ -173,6 +211,7 @@ def _dispatch(
         # The hub is the phone hotspot's access point: join the hotspot when
         # credentials are configured, then dial the default gateway. With no
         # credentials we still try the gateway (the Pi may already be joined).
+        joined = False
         if cfg.ssid:
             from ecosys_pi.network import NetworkError, join_hotspot
 
@@ -181,8 +220,14 @@ def _dispatch(
             except NetworkError as exc:
                 _emit(out, f"error: {exc}")
                 return EXIT_ERROR
+            joined = True
         try:
-            hub = resolve_hub(args.hub, environ=env, port=cfg.hub_port)
+            hub = _resolve_hub_with_retry(
+                override=args.hub,
+                environ=env,
+                port=cfg.hub_port,
+                timeout_s=GATEWAY_RETRY_TIMEOUT_S if joined else 0.0,
+            )
         except HubNotFoundError as exc:
             _emit(out, f"error: {exc}")
             return EXIT_ERROR

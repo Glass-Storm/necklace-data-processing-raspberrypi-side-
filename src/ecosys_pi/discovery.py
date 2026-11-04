@@ -8,13 +8,16 @@ client can dial, with a documented precedence:
 2. otherwise ``PI_ECOSYS_HUB`` from the environment;
 3. otherwise the default gateway
    (:func:`ecosys_pi.network.detect_default_gateway`) combined with the
-   configured ``hub_port`` (``PI_ECOSYS_HUB_PORT``, default ``9000``).
+   configured ``hub_port`` (``PI_ECOSYS_HUB_PORT``, default ``9000``). The
+   Wi-Fi station link (``wlan0``) is preferred; management links such as
+   ``usb0``/``eth0`` are never used, because their gateway is the host, not
+   the phone.
 
 There is **no mDNS**: discovery is gateway-only. Steps 1-2 are the escape hatch
 for tests and hosts where the hub is not the gateway - notably this repo's E2E
 harness, which dials loopback via ``--hub``/``PI_ECOSYS_HUB``. The gateway
 detector is injected through ``detect_gateway`` so unit tests never run
-``ip``/``nmcli``.
+``ip``/``nmcli``; the preferred interface is threaded through as a keyword.
 
 When nothing resolves, the caller gets a :class:`HubNotFoundError` whose message
 names ``PI_ECOSYS_HUB`` so the operator knows the escape hatch.
@@ -26,7 +29,11 @@ import os
 from collections.abc import Callable, Mapping
 
 from ecosys_pi.config import DEFAULT_HUB_PORT
-from ecosys_pi.network import detect_default_gateway, hub_from_gateway
+from ecosys_pi.network import (
+    PREFERRED_INTERFACE,
+    detect_default_gateway,
+    hub_from_gateway,
+)
 
 __all__ = [
     "ENV_HUB",
@@ -59,13 +66,16 @@ def resolve_hub(
     *,
     environ: Mapping[str, str] | None = None,
     port: int = DEFAULT_HUB_PORT,
-    detect_gateway: Callable[[], str | None] = detect_default_gateway,
+    preferred_interface: str | None = PREFERRED_INTERFACE,
+    detect_gateway: Callable[..., str | None] = detect_default_gateway,
 ) -> str:
     """Resolve the hub address by override -> env -> default gateway.
 
     ``override`` (the ``--hub`` flag) wins over ``PI_ECOSYS_HUB``, which wins
     over the detected default gateway. A blank override or env value is treated
-    as unset. ``port`` is the gRPC port appended to a gateway host. Raises
+    as unset. ``port`` is the gRPC port appended to a gateway host.
+    ``preferred_interface`` (``wlan0`` by default) is threaded to the detector
+    so the station link wins over a management link. Raises
     :class:`HubNotFoundError` - naming ``PI_ECOSYS_HUB`` and ``--hub`` - when no
     address can be determined.
     """
@@ -75,7 +85,7 @@ def resolve_hub(
     if chosen is not None:
         return chosen
 
-    gateway = detect_gateway()
+    gateway = detect_gateway(preferred_interface=preferred_interface)
     if gateway is None:
         raise HubNotFoundError(
             "no hub address found: no default gateway on this host; "

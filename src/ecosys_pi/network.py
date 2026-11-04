@@ -12,6 +12,11 @@ network:
 * :func:`detect_default_gateway` reads ``ip route`` (falling back to
   ``nmcli``) and parses the gateway address.
 
+The Pi reaches the phone over its Wi-Fi station link (``wlan0``), while SSH and
+the lab bench use management links (``usb0``/``eth0``). The detector therefore
+probes the preferred interface first and **never** falls back to a management
+link's gateway: dialing the host at ``10.55.0.1`` would silently bypass the hub.
+
 Every actual process is launched through an **injectable** ``runner`` so tests
 assert the exact argv and the parsed output without spawning ``nmcli``/``ip``.
 :func:`run_command` is the default runner.
@@ -26,6 +31,8 @@ from dataclasses import dataclass
 
 __all__ = [
     "DEFAULT_TIMEOUT_S",
+    "PREFERRED_INTERFACE",
+    "MANAGEMENT_INTERFACES",
     "SUPPORTED_SECURITY",
     "NetworkError",
     "HotspotConfigError",
@@ -42,6 +49,13 @@ __all__ = [
 
 #: How long a single ``nmcli``/``ip`` invocation may run before it is aborted.
 DEFAULT_TIMEOUT_S: float = 15.0
+
+#: The Wi-Fi station link whose default gateway is the phone hotspot hub.
+PREFERRED_INTERFACE: str = "wlan0"
+
+#: Management/backhaul links (USB SSH, wired lab). Their default gateway is the
+#: development host, never the hub, so the fallback must skip them.
+MANAGEMENT_INTERFACES: frozenset[str] = frozenset({"usb0", "eth0"})
 
 #: Wi-Fi security modes this module knows how to join (personal, pre-shared key).
 SUPPORTED_SECURITY: tuple[str, ...] = ("wpa2", "wpa3")
@@ -186,20 +200,62 @@ def _valid_address(candidate: str) -> str | None:
         return None
 
 
-def parse_default_gateway(output: str) -> str | None:
+def _route_device(tokens: Sequence[str]) -> str | None:
+    """Return the ``dev <iface>`` token of one ``ip route`` line, if present."""
+    if "dev" not in tokens:
+        return None
+    index = tokens.index("dev")
+    if index + 1 >= len(tokens):
+        return None
+    return tokens[index + 1]
+
+
+def _device_allowed(
+    device: str | None,
+    *,
+    interface: str | None,
+    excluded: frozenset[str],
+) -> bool:
+    """Whether a route/block on ``device`` may supply the hub gateway.
+
+    A known management or non-preferred device is rejected. An unattributed
+    line (no device token) is usable for the general fallback but never for an
+    explicit interface probe, where it cannot prove provenance.
+    """
+    if device is None:
+        return interface is None
+    if interface is not None and device != interface:
+        return False
+    return device not in excluded
+
+
+def parse_default_gateway(
+    output: str,
+    *,
+    interface: str | None = None,
+    excluded_interfaces: Sequence[str] = (),
+) -> str | None:
     """Extract the default-gateway address from ``ip route`` or ``nmcli`` text.
 
     Recognises both ``ip route`` (``default via 192.168.43.1 dev wlan0 ...``)
-    and ``nmcli --terse --fields IP4.GATEWAY ...`` (``IP4.GATEWAY:192.168.43.1``).
-    Returns ``None`` when there is no default route or no usable address; a
-    ``default ... scope link`` route with no ``via`` is a miss.
+    and ``nmcli --terse --fields GENERAL.DEVICE,IP4.GATEWAY ...`` blocks
+    (``GENERAL.DEVICE:wlan0`` followed by ``IP4.GATEWAY:192.168.43.1``).
+    ``interface`` restricts the answer to one link; ``excluded_interfaces``
+    drops management links from the answer. Returns ``None`` when no allowed
+    default route carries a usable address; a ``default ... scope link`` route
+    with no ``via`` is a miss.
     """
+    excluded = frozenset(excluded_interfaces)
+    current_device: str | None = None
     for raw_line in output.splitlines():
         line = raw_line.strip()
         if not line:
             continue
         if line.startswith("default"):
             tokens = line.split()
+            device = _route_device(tokens)
+            if not _device_allowed(device, interface=interface, excluded=excluded):
+                continue
             if "via" in tokens:
                 index = tokens.index("via")
                 if index + 1 < len(tokens):
@@ -208,8 +264,15 @@ def parse_default_gateway(output: str) -> str | None:
                         return found
             continue
         upper = line.upper()
+        if upper.startswith("GENERAL.DEVICE:"):
+            current_device = _clean(line.split(":", 1)[1])
+            continue
         for prefix in ("IP4.GATEWAY:", "IP6.GATEWAY:"):
             if upper.startswith(prefix):
+                if not _device_allowed(
+                    current_device, interface=interface, excluded=excluded
+                ):
+                    break
                 found = _valid_address(line[len(prefix) :].strip())
                 if found is not None:
                     return found
@@ -221,22 +284,56 @@ def parse_default_gateway(output: str) -> str | None:
 _GATEWAY_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("ip", "route", "show", "default"),
     ("ip", "route"),
-    ("nmcli", "--terse", "--fields", "IP4.GATEWAY", "device", "show"),
+    (
+        "nmcli",
+        "--terse",
+        "--fields",
+        "GENERAL.DEVICE,IP4.GATEWAY",
+        "device",
+        "show",
+    ),
 )
 
 
-def detect_default_gateway(*, runner: CommandRunner = run_command) -> str | None:
+def _gateway_probes(
+    preferred_interface: str | None,
+) -> list[tuple[tuple[str, ...], str | None, frozenset[str]]]:
+    """Return the ordered (argv, interface, excluded) gateway probes."""
+    probes: list[tuple[tuple[str, ...], str | None, frozenset[str]]] = []
+    if preferred_interface:
+        probes.append(
+            (
+                ("ip", "route", "show", "default", "dev", preferred_interface),
+                preferred_interface,
+                frozenset(),
+            )
+        )
+    probes.extend((argv, None, MANAGEMENT_INTERFACES) for argv in _GATEWAY_COMMANDS)
+    return probes
+
+
+def detect_default_gateway(
+    *,
+    preferred_interface: str | None = None,
+    runner: CommandRunner = run_command,
+) -> str | None:
     """Return the default gateway address, or ``None`` when there is none.
 
-    Tries each command in :data:`_GATEWAY_COMMANDS` until one succeeds and its
-    output names a usable gateway. A failed or empty command is skipped, so a
-    host without ``ip`` still resolves through ``nmcli`` and vice versa.
+    When ``preferred_interface`` is given (the caller uses ``wlan0``), that
+    link is probed first. Every fallback then excludes
+    :data:`MANAGEMENT_INTERFACES`, so a usb0/eth0 route can never be mistaken
+    for the phone hub. A failed or empty command is skipped, so a host without
+    ``ip`` still resolves through ``nmcli`` and vice versa.
     """
-    for argv in _GATEWAY_COMMANDS:
+    for argv, interface, excluded in _gateway_probes(preferred_interface):
         result = runner(argv)
         if result.returncode != 0:
             continue
-        gateway = parse_default_gateway(result.stdout)
+        gateway = parse_default_gateway(
+            result.stdout,
+            interface=interface,
+            excluded_interfaces=excluded,
+        )
         if gateway is not None:
             return gateway
     return None

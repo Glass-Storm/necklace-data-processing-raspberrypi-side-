@@ -331,6 +331,68 @@ def test_stdout_contract_is_the_frozen_lines() -> None:
     )
 
 
+# --- Gateway retry after a hotspot join (DHCP / association lag) -------------
+
+
+def test_gateway_retry_waits_for_dhcp_then_returns_the_hub(monkeypatch) -> None:
+    """A transient missing gateway is retried until the deadline is reached."""
+    from ecosys_pi.discovery import ENV_HUB, HubNotFoundError
+
+    attempts: list[int] = []
+
+    def resolve(override, *, environ, port):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) < 3:
+            raise HubNotFoundError(f"no gateway yet; set {ENV_HUB}=HOST:PORT")
+        return "192.168.43.1:9000"
+
+    sleeps: list[float] = []
+    clock_values = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr("ecosys_pi.discovery.resolve_hub", resolve)
+
+    hub = cli._resolve_hub_with_retry(
+        override=None,
+        environ={},
+        port=9000,
+        timeout_s=30.0,
+        interval_s=2.0,
+        clock=lambda: next(clock_values),
+        sleep=sleeps.append,
+    )
+
+    assert hub == "192.168.43.1:9000"
+    assert len(attempts) == 3
+    assert sleeps == [2.0, 2.0]
+
+
+def test_gateway_retry_does_not_wait_without_a_join(monkeypatch) -> None:
+    """With no join there is no DHCP lag to wait for: one attempt, then fail."""
+    from ecosys_pi.discovery import HubNotFoundError
+
+    attempts: list[int] = []
+
+    def resolve(override, *, environ, port):
+        attempts.append(1)
+        raise HubNotFoundError("no gateway")
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("ecosys_pi.discovery.resolve_hub", resolve)
+
+    with pytest.raises(HubNotFoundError):
+        cli._resolve_hub_with_retry(
+            override=None,
+            environ={},
+            port=9000,
+            timeout_s=0.0,
+            interval_s=2.0,
+            clock=lambda: 0.0,
+            sleep=sleeps.append,
+        )
+
+    assert len(attempts) == 1
+    assert sleeps == []
+
+
 # --- The real CLI path discovers config.json (task 12) -----------------------
 
 

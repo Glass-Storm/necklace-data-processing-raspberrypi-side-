@@ -8,21 +8,28 @@ injected with a deterministic stub, and the CLI seam is driven in-process.
 from __future__ import annotations
 
 import io
+from functools import partial
 
 import pytest
 
 from ecosys_pi import discovery
 from ecosys_pi.discovery import ENV_HUB, HubNotFoundError, resolve_hub
+from ecosys_pi.network import CommandResult, detect_default_gateway
 
 TARGET = "192.168.43.1:9000"
 GATEWAY = "192.168.43.1"
+
+
+def _result(*, returncode: int = 0, stdout: str = "") -> CommandResult:
+    """A scripted command result for a hermetic gateway runner."""
+    return CommandResult(argv=(), returncode=returncode, stdout=stdout, stderr="")
 
 
 def test_override_wins_without_touching_gateway() -> None:
     """The explicit override is PRIMARY for automation and skips gateway probing."""
     called: list[bool] = []
 
-    def explode() -> str | None:
+    def explode(*, preferred_interface=None) -> str | None:
         called.append(True)
         return "gateway-should-not-run"
 
@@ -40,7 +47,7 @@ def test_env_hub_wins_over_gateway() -> None:
     """``PI_ECOSYS_HUB`` is the second precedence level and skips the gateway."""
     called: list[bool] = []
 
-    def explode() -> str | None:
+    def explode(*, preferred_interface=None) -> str | None:
         called.append(True)
         return GATEWAY
 
@@ -54,7 +61,7 @@ def test_blank_override_and_env_are_treated_as_unset(blank: str) -> None:
     result = resolve_hub(
         blank,
         environ={ENV_HUB: blank},
-        detect_gateway=lambda: GATEWAY,
+        detect_gateway=lambda *, preferred_interface=None: GATEWAY,
     )
 
     assert result == TARGET
@@ -62,13 +69,22 @@ def test_blank_override_and_env_are_treated_as_unset(blank: str) -> None:
 
 def test_gateway_host_with_default_port() -> None:
     """A detected default gateway yields ``gateway:9000`` by default."""
-    assert resolve_hub(environ={}, detect_gateway=lambda: GATEWAY) == TARGET
+    assert (
+        resolve_hub(
+            environ={}, detect_gateway=lambda *, preferred_interface=None: GATEWAY
+        )
+        == TARGET
+    )
 
 
 def test_gateway_host_honours_a_configured_port() -> None:
     """``hub_port`` (PI_ECOSYS_HUB_PORT) chooses the port on the gateway host."""
     assert (
-        resolve_hub(environ={}, port=60061, detect_gateway=lambda: GATEWAY)
+        resolve_hub(
+            environ={},
+            port=60061,
+            detect_gateway=lambda *, preferred_interface=None: GATEWAY,
+        )
         == "192.168.43.1:60061"
     )
 
@@ -76,11 +92,43 @@ def test_gateway_host_honours_a_configured_port() -> None:
 def test_no_default_route_raises_error_naming_env_hub() -> None:
     """With no override/env and no default route, the typed error plus escape hatch."""
     with pytest.raises(HubNotFoundError) as excinfo:
-        resolve_hub(environ={}, detect_gateway=lambda: None)
+        resolve_hub(environ={}, detect_gateway=lambda *, preferred_interface=None: None)
 
     message = str(excinfo.value)
     assert ENV_HUB in message
     assert "--hub" in message
+
+
+def test_resolve_hub_threads_the_preferred_interface() -> None:
+    """The default gateway probe is told to prefer the wlan0 station link."""
+    seen: list[str | None] = []
+
+    def detect(*, preferred_interface: str | None = None) -> str | None:
+        seen.append(preferred_interface)
+        return GATEWAY
+
+    assert resolve_hub(environ={}, detect_gateway=detect) == TARGET
+    assert seen == ["wlan0"]
+
+
+def test_usb0_only_route_fails_clearly_and_never_dials_the_host() -> None:
+    """A usb0-only host is a clear miss naming PI_ECOSYS_HUB, never 10.55.0.1."""
+    management_route = "default via 10.55.0.1 dev usb0 proto dhcp metric 100\n"
+
+    def runner(argv) -> CommandResult:
+        if len(argv) >= 2 and argv[0] == "ip" and argv[1] == "route":
+            return _result(stdout=management_route)
+        return _result(returncode=127)
+
+    detector = partial(detect_default_gateway, runner=runner)
+
+    with pytest.raises(HubNotFoundError) as excinfo:
+        resolve_hub(environ={}, detect_gateway=detector)
+
+    message = str(excinfo.value)
+    assert ENV_HUB in message
+    assert "--hub" in message
+    assert "10.55.0.1" not in message
 
 
 # --- CLI seam: the frozen stdout/exit contract still holds --------------------
