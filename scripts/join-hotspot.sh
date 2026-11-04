@@ -93,11 +93,12 @@ escape_value() {
 
 # Interfaces (of the management set) that currently carry an IPv4 address.
 management_links_with_ipv4() {
-	local iface
+	local iface addresses
 	for iface in "${MANAGEMENT_IFACES[@]}"; do
-		if ip -4 addr show dev "$iface" 2>/dev/null | grep -q 'inet '; then
-			printf '%s\n' "$iface"
-		fi
+		addresses="$(ip -4 addr show dev "$iface" 2>/dev/null || true)"
+		case "$addresses" in
+		*"inet "*) printf '%s\n' "$iface" ;;
+		esac
 	done
 }
 
@@ -105,12 +106,14 @@ management_links_with_ipv4() {
 BASELINE_MANAGEMENT_LINKS="$(management_links_with_ipv4 || true)"
 
 verify_management_links() {
-	local iface lost=()
+	local iface addresses lost=()
 	while IFS= read -r iface; do
 		[ -n "$iface" ] || continue
-		if ! ip -4 addr show dev "$iface" 2>/dev/null | grep -q 'inet '; then
-			lost+=("$iface")
-		fi
+		addresses="$(ip -4 addr show dev "$iface" 2>/dev/null || true)"
+		case "$addresses" in
+		*"inet "*) ;;
+		*) lost+=("$iface") ;;
+		esac
 	done <<<"$BASELINE_MANAGEMENT_LINKS"
 	if [ "${#lost[@]}" -gt 0 ]; then
 		die "management link(s) lost their IPv4 address: ${lost[*]}"
@@ -188,10 +191,11 @@ status=""
 deadline=$((SECONDS + VERIFY_TIMEOUT_S))
 while [ "$SECONDS" -lt "$deadline" ]; do
 	status="$(wpa_cli -i "$IFACE" status 2>/dev/null || true)"
-	if printf '%s\n' "$status" | grep -q '^wpa_state=COMPLETED$'; then
-		if ip -4 addr show dev "$IFACE" 2>/dev/null | grep -q 'inet '; then
-			break
-		fi
+	if [[ "$status" == *"wpa_state=COMPLETED"* ]]; then
+		addresses="$(ip -4 addr show dev "$IFACE" 2>/dev/null || true)"
+		case "$addresses" in
+		*"inet "*) break ;;
+		esac
 	fi
 	sleep 1
 done
