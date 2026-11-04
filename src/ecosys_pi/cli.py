@@ -140,7 +140,6 @@ def main(
     parser = build_parser()
     args = parser.parse_args(sys.argv[1:] if argv is None else list(argv))
 
-    env = os.environ if environ is None else environ
     out: IO[str] = sys.stdout if stdout is None else stdout
     err: IO[str] = sys.stderr if stderr is None else stderr
 
@@ -148,19 +147,24 @@ def main(
     # fallback) must never pollute the frozen stdout contract; our own lines use
     # the captured ``out`` object explicitly, so they are unaffected.
     with contextlib.redirect_stdout(err):
-        return _dispatch(args, env, out, err)
+        # ``environ`` is passed through unresolved: ``None`` means a real run,
+        # which enables ``.env``/``config.json`` discovery in ``_dispatch``.
+        return _dispatch(args, environ, out, err)
 
 
 def _dispatch(
     args: argparse.Namespace,
-    env: Mapping[str, str],
+    environ: Mapping[str, str] | None,
     out: IO[str],
     err: IO[str],
 ) -> int:
     """Resolve config and hub, then run the media session unauthenticated."""
     from ecosys_pi.discovery import HubNotFoundError, resolve_hub
 
-    cfg = load_config(env)
+    env = os.environ if environ is None else environ
+    # A real run (``environ`` unset) lets ``load_config`` discover the files in
+    # the working directory; the injected mapping stays hermetic for tests.
+    cfg = load_config() if environ is None else load_config(environ)
     hub = args.hub or cfg.hub
     if not hub:
         # The hub is the phone hotspot's access point: join the hotspot when

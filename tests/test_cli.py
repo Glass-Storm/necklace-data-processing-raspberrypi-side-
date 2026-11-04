@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import re
 import subprocess
@@ -328,6 +329,101 @@ def test_stdout_contract_is_the_frozen_lines() -> None:
         "transcript <text>",
         "error: <detail>",
     )
+
+
+# --- The real CLI path discovers config.json (task 12) -----------------------
+
+
+def _clean_pi_environ(monkeypatch: pytest.MonkeyPatch) -> None:
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("PI_ECOSYS_")}
+    monkeypatch.setattr(os, "environ", clean)
+
+
+def test_real_path_loads_config_file_from_cwd(tmp_path, monkeypatch) -> None:
+    """``environ=None`` (a real run) honours ssid/hub/hub_port from config.json."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"ssid": "pi-net", "hub": "10.0.0.5:9100", "hub_port": 9100}),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    _clean_pi_environ(monkeypatch)
+
+    seen: dict[str, object] = {}
+    real_load_config = cli.load_config
+
+    def spy(environ=None, **kwargs):
+        config = real_load_config(environ, **kwargs)
+        seen["config"] = config
+        return config
+
+    async def fake_session(hub, **kwargs):
+        seen["hub"] = hub
+        return cli.EXIT_OK
+
+    monkeypatch.setattr(cli, "load_config", spy)
+    monkeypatch.setattr(cli, "_run_session", fake_session)
+    monkeypatch.setattr("ecosys_pi.network.join_hotspot", lambda *a, **k: None)
+
+    rc = cli.main(
+        ["--frames", "0"],
+        environ=None,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert rc == cli.EXIT_OK
+    config = seen["config"]
+    assert config.ssid == "pi-net"
+    assert config.hub == "10.0.0.5:9100"
+    assert config.hub_port == 9100
+    assert seen["hub"] == "10.0.0.5:9100"
+
+
+def test_blank_config_file_values_fall_through_to_env(tmp_path, monkeypatch) -> None:
+    """A blank value in config.json is unset and falls through to the environment."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"ssid": "  ", "hub": "", "tts_lang": "", "hub_port": ""}),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("PI_ECOSYS_")}
+    clean.update(
+        {
+            "PI_ECOSYS_SSID": "env-net",
+            "PI_ECOSYS_HUB": "10.0.0.6:9200",
+            "PI_ECOSYS_HUB_PORT": "9200",
+        }
+    )
+    monkeypatch.setattr(os, "environ", clean)
+
+    seen: dict[str, object] = {}
+    real_load_config = cli.load_config
+
+    def spy(environ=None, **kwargs):
+        config = real_load_config(environ, **kwargs)
+        seen["config"] = config
+        return config
+
+    async def fake_session(hub, **kwargs):
+        return cli.EXIT_OK
+
+    monkeypatch.setattr(cli, "load_config", spy)
+    monkeypatch.setattr(cli, "_run_session", fake_session)
+    monkeypatch.setattr("ecosys_pi.network.join_hotspot", lambda *a, **k: None)
+
+    rc = cli.main(
+        ["--frames", "0"],
+        environ=None,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert rc == cli.EXIT_OK
+    config = seen["config"]
+    assert config.ssid == "env-net"
+    assert config.hub == "10.0.0.6:9200"
+    assert config.hub_port == 9200
+    assert config.tts_lang == "yue"
 
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation
