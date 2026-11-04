@@ -159,7 +159,8 @@ are frozen. Informational chatter from the media/playback modules goes to
 | `PI_ECOSYS_TTS_LANG`           | `yue`                  | Retained for compatibility; has no effect on the wire (the hub selects the voice).                |
 | `PI_ECOSYS_DEVICE_NAME`        | `socket.gethostname()` | Label sent in the `stream_open` frame; blank falls back to the hostname, then `ecosys-pi`.        |
 | `PI_ECOSYS_AUDIO_SOURCE`       | `auto`                 | `auto` / `synthetic` / `sounddevice` / `arecord`. `synthetic` is deterministic (used by tests).   |
-| `PI_ECOSYS_VIDEO_SOURCE`       | `auto`                 | `auto` / `synthetic` / `picamera2`. `picamera2` when absent falls back to `synthetic`.            |
+| `PI_ECOSYS_VIDEO_SOURCE`       | `auto`                 | `auto` / `synthetic` / `uvc` / `picamera2`. `uvc` is the demo path and hard-fails when its device or ffmpeg is missing; `auto` prefers picamera2, then `/dev/video0` + ffmpeg, then a loud synthetic fallback. |
+| `PI_ECOSYS_VIDEO_DEVICE`       | `/dev/video0`          | UVC/V4L2 capture node for `PI_ECOSYS_VIDEO_SOURCE=uvc` (or auto). Used by the missing-device probe. |
 
 > **systemd caveat.** The client reads the _process_ environment. A unit started
 > for a service user gets a fresh, minimal environment — set variables with

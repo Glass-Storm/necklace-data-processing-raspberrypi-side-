@@ -12,7 +12,9 @@ synthetic frame is a pre-encoded golden JPEG, so the suite is hermetic.
 
 from __future__ import annotations
 
+import io
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -150,6 +152,7 @@ def test_select_synthetic_when_picamera2_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(camera, "_picamera2_available", lambda: False)
+    monkeypatch.setattr(camera, "_uvc_device_present", lambda _path: False)
     assert isinstance(camera.select_video_source(env={}), camera.SyntheticJpegSource)
 
 
@@ -311,3 +314,200 @@ def test_jpeg_source_drops_an_oversize_frame(monkeypatch: pytest.MonkeyPatch) ->
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation
     pytest.main([__file__])
+
+
+# --- UVC / V4L2 MJPEG source -------------------------------------------------
+
+#: A tiny fixture MJPEG stream: three SOI/EOI-delimited "JPEGs", with junk
+#: before the first frame, between frames, and after the last one (ffmpeg writes
+#: a raw byte stream, so the parser must resynchronise on SOI).
+_MJPEG_FRAME_ONE = b"\xff\xd8" + b"frame-one" * 4 + b"\xff\xd9"
+_MJPEG_FRAME_TWO = b"\xff\xd8" + b"frame-two" * 4 + b"\xff\xd9"
+_MJPEG_FRAME_THREE = b"\xff\xd8" + b"frame-three" * 4 + b"\xff\xd9"
+_MJPEG_FIXTURE = (
+    b"\x00junk"
+    + _MJPEG_FRAME_ONE
+    + b"gap"
+    + _MJPEG_FRAME_TWO
+    + _MJPEG_FRAME_THREE
+    + b"trailer"
+)
+
+
+def test_mjpeg_parser_splits_concatenated_jpegs() -> None:
+    parser = camera.MjpegFrameParser()
+    frames = parser.feed(_MJPEG_FIXTURE)
+    assert len(frames) == 3, "one frame per SOI/EOI pair"
+    assert frames == [_MJPEG_FRAME_ONE, _MJPEG_FRAME_TWO, _MJPEG_FRAME_THREE]
+    for frame in frames:
+        assert frame[:2] == b"\xff\xd8", "frame must start with the JPEG SOI"
+        assert frame[-2:] == b"\xff\xd9", "frame must end with the JPEG EOI"
+
+
+def test_mjpeg_parser_tolerates_a_split_at_every_byte() -> None:
+    parser = camera.MjpegFrameParser()
+    frames: list[bytes] = []
+    for index in range(len(_MJPEG_FIXTURE)):
+        frames.extend(parser.feed(_MJPEG_FIXTURE[index : index + 1]))
+    assert frames == [_MJPEG_FRAME_ONE, _MJPEG_FRAME_TWO, _MJPEG_FRAME_THREE]
+
+
+def test_mjpeg_parser_never_emits_a_truncated_frame() -> None:
+    parser = camera.MjpegFrameParser()
+    assert parser.feed(_MJPEG_FRAME_ONE[:8]) == [], "partial frame must be buffered"
+    assert parser.feed(_MJPEG_FRAME_ONE[8:]) == [_MJPEG_FRAME_ONE]
+
+
+def test_mjpeg_parser_drops_an_oversize_frame_and_resyncs() -> None:
+    parser = camera.MjpegFrameParser(max_frame_bytes=len(_MJPEG_FRAME_TWO) + 4)
+    oversize = b"\xff\xd8" + b"x" * 64 + b"\xff\xd9"
+    assert parser.feed(oversize + _MJPEG_FRAME_TWO[:8]) == []
+    assert parser.feed(_MJPEG_FRAME_TWO[8:]) == [_MJPEG_FRAME_TWO]
+    assert parser.dropped == 1
+
+
+class _FakeFfmpegProcess:
+    """Stands in for the persistent ffmpeg subprocess (no hardware needed)."""
+
+    def __init__(self, payload: bytes) -> None:
+        self.stdout = io.BytesIO(payload)
+        self.stderr = io.BytesIO(b"")
+        self.returncode: int | None = None
+        self.terminated = 0
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated += 1
+        self.returncode = -15
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+
+def _install_fake_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch, payload: bytes
+) -> tuple[_FakeFfmpegProcess, list[list[str]], object]:
+    """Make ``ffmpeg`` resolve without spawning a real process."""
+    process = _FakeFfmpegProcess(payload)
+    commands: list[list[str]] = []
+
+    def _popen(command: list[str], **_kwargs: object) -> _FakeFfmpegProcess:
+        commands.append(command)
+        return process
+
+    monkeypatch.setattr(camera, "_ffmpeg_available", lambda _name: "/usr/bin/ffmpeg")
+    return process, commands, _popen
+
+
+def test_uvc_source_reads_frames_from_the_ffmpeg_stream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    device = tmp_path / "video0"
+    device.write_bytes(b"")
+    process, commands, popen = _install_fake_ffmpeg(monkeypatch, _MJPEG_FIXTURE)
+    source = camera.UvcVideoSource(device=str(device), popen=popen)
+
+    assert source.open() is True
+    command = commands[0]
+    assert command[0] == "/usr/bin/ffmpeg"
+    assert command[command.index("-f") + 1] == "v4l2"
+    assert command[command.index("-i") + 1] == str(device)
+    assert "image2pipe" in command
+    assert "mjpeg" in command
+
+    frames = [source.read_frame() for _ in range(3)]
+    assert frames == [_MJPEG_FRAME_ONE, _MJPEG_FRAME_TWO, _MJPEG_FRAME_THREE]
+    assert all(frame is not None and frame[-2:] == b"\xff\xd9" for frame in frames)
+
+    with pytest.raises(camera.CameraSourceError):
+        source.read_frame()  # ffmpeg EOF/device loss is a named, visible error
+    assert source.done is True
+    source.close()
+    assert process.terminated == 1
+
+
+def test_uvc_source_missing_device_is_a_named_error(tmp_path: Path) -> None:
+    missing = tmp_path / "video9"
+    source = camera.UvcVideoSource(device=str(missing))
+    with pytest.raises(camera.CameraSourceError, match="video9"):
+        source.open()
+    assert source.read_frame() is None
+
+
+def test_uvc_source_missing_ffmpeg_is_a_named_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    device = tmp_path / "video0"
+    device.write_bytes(b"")
+    monkeypatch.setattr(camera, "_ffmpeg_available", lambda _name: None)
+    source = camera.UvcVideoSource(device=str(device))
+    with pytest.raises(camera.CameraSourceError, match="ffmpeg"):
+        source.open()
+
+
+def test_uvc_source_close_is_idempotent_and_terminates_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    device = tmp_path / "video0"
+    device.write_bytes(b"")
+    process, _commands, popen = _install_fake_ffmpeg(monkeypatch, _MJPEG_FRAME_ONE)
+    source = camera.UvcVideoSource(device=str(device), popen=popen)
+
+    source.close()
+    assert source.open() is True
+    source.close()
+    source.close()
+    assert process.terminated == 1
+    assert source.read_frame() is None
+
+
+def test_select_uvc_when_env_forces_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(camera, "_ffmpeg_available", lambda _name: "/usr/bin/ffmpeg")
+    source = camera.select_video_source(
+        env={
+            camera.ENV_VIDEO_SOURCE: "uvc",
+            camera.ENV_VIDEO_DEVICE: "/dev/video7",
+        }
+    )
+    assert isinstance(source, camera.UvcVideoSource)
+    assert source.device == "/dev/video7"
+
+
+def test_select_uvc_logs_the_selected_source(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(camera, "_ffmpeg_available", lambda _name: "/usr/bin/ffmpeg")
+    camera.select_video_source(env={camera.ENV_VIDEO_SOURCE: "uvc"})
+    assert "[Pi Camera] source=uvc" in capsys.readouterr().out
+
+
+def test_auto_prefers_uvc_over_synthetic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(camera, "_picamera2_available", lambda: False)
+    monkeypatch.setattr(camera, "_uvc_device_present", lambda _path: True)
+    monkeypatch.setattr(camera, "_ffmpeg_available", lambda _name: "/usr/bin/ffmpeg")
+    assert isinstance(camera.select_video_source(env={}), camera.UvcVideoSource)
+
+
+def test_auto_still_prefers_picamera2_when_it_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(camera, "_picamera2_available", lambda: True)
+    monkeypatch.setattr(camera, "_uvc_device_present", lambda _path: True)
+    assert isinstance(camera.select_video_source(env={}), camera.JpegVideoSource)
+
+
+def test_auto_falls_back_to_synthetic_without_a_camera(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(camera, "_picamera2_available", lambda: False)
+    monkeypatch.setattr(camera, "_uvc_device_present", lambda _path: False)
+    assert isinstance(camera.select_video_source(env={}), camera.SyntheticJpegSource)

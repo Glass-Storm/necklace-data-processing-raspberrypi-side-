@@ -6,18 +6,26 @@ decodes each still to run isolated gesture recognition on the person the necklac
 points at. There is **no H.264 path on the Pi** any more -- one JPEG per gesture
 sample matches the per-image recogniser and keeps the constrained device light.
 
-``picamera2`` is an OPTIONAL extra and is imported lazily, so this module MUST
-import (and its tests MUST pass) on a non-Pi host with no camera. Only
-:meth:`JpegVideoSource.open` touches the hardware, and it reports "no camera" by
-returning ``False`` instead of raising -- the posture ported from the legacy
-OpenCV ``video_stream.py``.
+Two hardware backends are provided: the CSI path (:class:`JpegVideoSource` via
+``picamera2``, an OPTIONAL extra imported lazily) and the USB webcam path
+(:class:`UvcVideoSource`, a persistent ``ffmpeg`` V4L2 -> MJPEG pump). Both parse
+the same ``ImageFrame`` contract. Importing this module MUST succeed on a
+non-Pi host with no camera: only ``open()`` touches hardware.
+
+The CSI source reports "no camera" by returning ``False`` (the posture ported
+from the legacy OpenCV ``video_stream.py``). The UVC source, when selected
+explicitly with ``PI_ECOSYS_VIDEO_SOURCE=uvc`` for the demo, instead raises the
+named :class:`CameraSourceError` for a missing device/ffmpeg or a mid-stream
+device loss, so the client exits non-zero rather than silently degrading to
+synthetic video.
 
 Frame-size budget
 -----------------
-The hub's default gRPC inbound limit is **4 MiB**. A 320x240 JPEG is a few tens of
-KiB even at high quality, so :data:`MAX_JPEG_BYTES` (256 KiB, 1/16 of the hub
-limit) is a generous ceiling that a single still can never approach; the real
-source drops anything past it rather than letting one frame blow the session.
+The hub's default gRPC inbound limit is **4 MiB**. A 320x240 (or the USB webcam's
+native 640x480) JPEG is a few tens of KiB even at high quality, so
+:data:`MAX_JPEG_BYTES` (256 KiB, 1/16 of the hub limit) is a generous ceiling that
+a single still can never approach; the real sources drop anything past it rather
+than letting one frame blow the session.
 """
 
 from __future__ import annotations
@@ -26,19 +34,31 @@ import base64
 import importlib.util
 import io
 import os
+import shutil
+import subprocess
+import threading
+from collections import deque
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
+    "CameraSourceError",
     "DEFAULT_FRAMERATE",
     "DEFAULT_HEIGHT",
+    "DEFAULT_UVC_HEIGHT",
+    "DEFAULT_UVC_QUALITY",
+    "DEFAULT_UVC_WIDTH",
+    "DEFAULT_VIDEO_DEVICE",
     "DEFAULT_WIDTH",
+    "ENV_VIDEO_DEVICE",
     "ENV_VIDEO_SOURCE",
     "FRAME_INTERVAL_S",
     "HUB_INBOUND_LIMIT_BYTES",
     "JpegVideoSource",
     "MAX_JPEG_BYTES",
+    "MjpegFrameParser",
     "SyntheticJpegSource",
+    "UvcVideoSource",
     "VideoSource",
     "jpeg_dimensions",
     "select_video_source",
@@ -91,11 +111,32 @@ _SYNTHETIC_JPEG_B64 = (
     "ooooooooooooooooooooooooooooooooooooooooor//2Q=="
 )
 
+#: Default UVC/V4L2 capture node. The necklace webcam is a USB UVC device.
+DEFAULT_VIDEO_DEVICE = "/dev/video0"
+
+#: Environment variable overriding the UVC capture node (documented probe seam).
+ENV_VIDEO_DEVICE = "PI_ECOSYS_VIDEO_DEVICE"
+
+#: The necklace webcam advertises MJPG at 640x480 (no 320x240 mode), so the UVC
+#: source captures at that native size; the hub's recogniser resizes as needed.
+DEFAULT_UVC_WIDTH = 640
+DEFAULT_UVC_HEIGHT = 480
+
+#: ffmpeg MJPEG quality (1 = best, 31 = worst) for the V4L2 -> image2pipe pump.
+DEFAULT_UVC_QUALITY = 5
+
+#: ffmpeg executable looked up on PATH for the UVC source.
+DEFAULT_FFMPEG = "ffmpeg"
+
 #: Environment variable selecting the video source: ``auto`` (default),
-#: ``synthetic``, ``jpeg`` / ``picamera2_jpeg`` / ``picamera2``.
+#: ``synthetic``, ``uvc``, ``jpeg`` / ``picamera2_jpeg`` / ``picamera2``.
 ENV_VIDEO_SOURCE = "PI_ECOSYS_VIDEO_SOURCE"
 
 _JPEG_NATIVE_SOURCE_CHOICES = frozenset({"jpeg", "jpg", "picamera2_jpeg", "picamera2"})
+
+#: JPEG frame delimiters used by the MJPEG parser.
+_JPEG_SOI = b"\xff\xd8"
+_JPEG_EOI = b"\xff\xd9"
 
 # The markers that introduce a Start-Of-Frame segment (SOF0..SOF15), minus the
 # three codes that share the range but are NOT a frame header: DHT (C4),
@@ -147,7 +188,81 @@ def jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
     return None
 
 
+# --- MJPEG frame parsing (pure byte logic, testable without a device) --------
+
+
+class MjpegFrameParser:
+    """Split an MJPEG byte stream into complete JPEG frames on SOI/EOI markers.
+
+    ffmpeg writes a raw concatenation of JPEGs to ``image2pipe``; reads arrive in
+    arbitrary chunks, so a frame header/footer can be split across two reads. The
+    parser buffers partial frames and only ever returns bytes that start with
+    ``FF D8`` and end with ``FF D9`` -- a truncated frame is never emitted. Junk
+    between frames (or a resync after device loss) is skipped by scanning for the
+    next SOI, and frames larger than ``max_frame_bytes`` are dropped so a runaway
+    stream can never grow the buffer without bound.
+
+    The parser is deliberately pure (no subprocess, no camera) so the framing
+    rules are unit-testable with a fixture byte stream.
+    """
+
+    def __init__(self, max_frame_bytes: int = MAX_JPEG_BYTES) -> None:
+        self._max_frame_bytes = max_frame_bytes
+        self._buffer = bytearray()
+        self.dropped = 0
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        """Append ``chunk`` and return every complete JPEG it completed."""
+        if chunk:
+            self._buffer.extend(chunk)
+        frames: list[bytes] = []
+        while True:
+            buffer = self._buffer
+            start = buffer.find(_JPEG_SOI)
+            if start < 0:
+                # No SOI yet: keep only a trailing 0xFF, which may be the first
+                # byte of an SOI split across the next chunk.
+                if buffer and buffer[-1] == 0xFF:
+                    del buffer[: len(buffer) - 1]
+                else:
+                    buffer.clear()
+                break
+            if start:
+                del buffer[:start]
+            end = buffer.find(_JPEG_EOI, 2)
+            if end < 0:
+                if len(buffer) > self._max_frame_bytes + 2:
+                    self.dropped += 1
+                    next_start = buffer.find(_JPEG_SOI, 1)
+                    if next_start < 0:
+                        if buffer and buffer[-1] == 0xFF:
+                            del buffer[: len(buffer) - 1]
+                        else:
+                            buffer.clear()
+                        break
+                    del buffer[:next_start]
+                    continue
+                break
+            frame = bytes(buffer[: end + 2])
+            del buffer[: end + 2]
+            if len(frame) > self._max_frame_bytes:
+                self.dropped += 1
+                continue
+            frames.append(frame)
+        return frames
+
+
 # --- The video-source contract ----------------------------------------------
+
+
+class CameraSourceError(RuntimeError):
+    """A camera that was explicitly selected could not start, or died mid-stream.
+
+    Unlike :class:`JpegVideoSource` (which reports "no camera" by returning
+    ``False``), an explicit ``PI_ECOSYS_VIDEO_SOURCE=uvc`` request must never
+    silently degrade to synthetic video: the client surfaces this error and exits
+    non-zero.
+    """
 
 
 @runtime_checkable
@@ -405,6 +520,216 @@ class JpegVideoSource:
                 print(f"[Pi Camera] error while closing camera: {exc}")
 
 
+# --- UVC/V4L2 source (persistent ffmpeg, USB webcam) ------------------------
+
+
+def _uvc_device_present(path: str) -> bool:
+    """True when the V4L2 capture node exists (a seam for hermetic tests)."""
+    return os.path.exists(path)
+
+
+def _ffmpeg_available(name: str) -> str | None:
+    """Resolve the ffmpeg executable to an absolute path, or ``None``."""
+    return shutil.which(name)
+
+
+class UvcVideoSource:
+    """Persistent UVC/V4L2 MJPEG source driven by a single ffmpeg process.
+
+    ffmpeg captures the USB webcam (MJPG) and writes a raw concatenation of JPEGs
+    to stdout; :class:`MjpegFrameParser` turns that byte stream into complete
+    stills. The process is started once in :meth:`open` and stopped in
+    :meth:`close`, so no per-frame renegotiation happens on the constrained Pi.
+
+    Availability posture differs from :class:`JpegVideoSource`: when this source
+    was *explicitly* selected, a missing device or a missing ffmpeg is a hard,
+    named :class:`CameraSourceError` (the caller exits non-zero) rather than a
+    silent fallback to synthetic video. ``stderr`` from ffmpeg is drained on a
+    daemon thread so a chatty process can never block on a full pipe.
+    """
+
+    def __init__(
+        self,
+        device: str = DEFAULT_VIDEO_DEVICE,
+        width: int = DEFAULT_UVC_WIDTH,
+        height: int = DEFAULT_UVC_HEIGHT,
+        quality: int = DEFAULT_UVC_QUALITY,
+        ffmpeg: str = DEFAULT_FFMPEG,
+        popen: Callable[..., Any] | None = None,
+    ) -> None:
+        self.device = device
+        self.width = width
+        self.height = height
+        self._quality = quality
+        self._ffmpeg = ffmpeg
+        self._popen = popen if popen is not None else subprocess.Popen
+        self._process: Any | None = None
+        self._parser = MjpegFrameParser()
+        self._pending: list[bytes] = []
+        self._stderr_lines: deque[str] = deque(maxlen=20)
+        self._exhausted = False
+
+    @property
+    def done(self) -> bool:
+        """True once the ffmpeg stream ended and no parsed frame is pending."""
+        if self._process is None:
+            return self._exhausted
+        return self._exhausted and not self._pending
+
+    def ffmpeg_command(self, executable: str | None = None) -> list[str]:
+        """The exact persistent ffmpeg pipeline used for the webcam."""
+        binary = executable if executable is not None else self._ffmpeg
+        return [
+            binary,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "v4l2",
+            "-video_size",
+            f"{self.width}x{self.height}",
+            "-i",
+            self.device,
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-q:v",
+            str(self._quality),
+            "-",
+        ]
+
+    def open(self) -> bool:
+        """Start ffmpeg. Raises :class:`CameraSourceError` when unavailable."""
+        self._release_process()
+        self._parser = MjpegFrameParser()
+        self._pending = []
+        self._stderr_lines.clear()
+        self._exhausted = False
+
+        if not _uvc_device_present(self.device):
+            raise CameraSourceError(
+                f"[Pi Camera] UVC device {self.device} is missing; "
+                f"set {ENV_VIDEO_DEVICE} or plug the webcam in"
+            )
+        executable = _ffmpeg_available(self._ffmpeg)
+        if executable is None:
+            raise CameraSourceError(
+                f"[Pi Camera] ffmpeg executable {self._ffmpeg!r} was not found on "
+                "PATH; the UVC source cannot start"
+            )
+        try:
+            process = self._popen(
+                self.ffmpeg_command(executable),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+        except OSError as exc:  # pragma: no cover - spawn failure is host-specific
+            raise CameraSourceError(
+                f"[Pi Camera] could not start ffmpeg for {self.device}: {exc}"
+            ) from exc
+        self._process = process
+        stderr = getattr(process, "stderr", None)
+        if stderr is not None:
+            threading.Thread(
+                target=self._drain_stderr,
+                args=(stderr,),
+                name="ecosys-ffmpeg-stderr",
+                daemon=True,
+            ).start()
+        print(
+            f"[Pi Camera] source=uvc device={self.device} "
+            f"{self.width}x{self.height} q={self._quality}"
+        )
+        return True
+
+    def read_frame(self) -> bytes | None:
+        """Return the next complete JPEG, or raise when ffmpeg/device dies."""
+        if self._process is None:
+            return None
+        while True:
+            if self._pending:
+                frame = self._pending.pop(0)
+                if len(frame) > MAX_JPEG_BYTES:
+                    print(
+                        f"[Pi Camera] dropping oversize UVC still "
+                        f"({len(frame)} B, cap {MAX_JPEG_BYTES} B)"
+                    )
+                    continue
+                return frame
+            chunk = self._read_chunk()
+            if not chunk:
+                self._exhausted = True
+                raise CameraSourceError(self._eof_message())
+            self._pending.extend(self._parser.feed(chunk))
+
+    def close(self) -> None:
+        """Terminate ffmpeg and release its pipes; safe to call repeatedly."""
+        self._release_process()
+        self._exhausted = True
+
+    def _read_chunk(self) -> bytes:
+        process = self._process
+        if process is None:
+            return b""
+        stream = getattr(process, "stdout", None)
+        if stream is None:
+            return b""
+        read1 = getattr(stream, "read1", None)
+        try:
+            chunk = read1(65536) if read1 is not None else stream.read(65536)
+        except (OSError, ValueError):
+            return b""
+        return b"" if chunk is None else chunk
+
+    def _eof_message(self) -> str:
+        process = self._process
+        code = process.poll() if process is not None else None
+        diagnostics = "; ".join(self._stderr_lines) or "no ffmpeg diagnostics"
+        return (
+            f"[Pi Camera] UVC capture from {self.device} ended unexpectedly "
+            f"(ffmpeg exit code {code!r}): {diagnostics}"
+        )
+
+    def _drain_stderr(self, stream: Any) -> None:
+        try:
+            for raw in iter(stream.readline, b""):
+                line = raw.decode("utf-8", "replace").strip()
+                if line:
+                    self._stderr_lines.append(line)
+        except (OSError, ValueError):  # pragma: no cover - pipe torn down
+            return
+
+    def _release_process(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except (OSError, ValueError):
+            pass
+        try:
+            process.wait(timeout=2)
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            try:
+                process.kill()
+                process.wait(timeout=2)
+            except Exception:  # noqa: BLE001 - teardown must never raise
+                pass
+        for attribute in ("stdout", "stderr"):
+            stream = getattr(process, attribute, None)
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
+
 # --- Selection by availability + env ----------------------------------------
 
 
@@ -414,24 +739,41 @@ def select_video_source(
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
     framerate: float = DEFAULT_FRAMERATE,
+    uvc_width: int = DEFAULT_UVC_WIDTH,
+    uvc_height: int = DEFAULT_UVC_HEIGHT,
 ) -> VideoSource:
     """Choose a :class:`VideoSource` from availability and ``PI_ECOSYS_VIDEO_SOURCE``.
 
     Values (case-insensitive):
 
     * ``synthetic`` -- always the deterministic camera-free source.
+    * ``uvc`` -- the UVC/V4L2 source on ``PI_ECOSYS_VIDEO_DEVICE`` (default
+      ``/dev/video0``). This is the DEMO path and never falls back: a missing
+      device or ffmpeg raises :class:`CameraSourceError` at :meth:`open`.
     * ``jpeg`` / ``jpg`` / ``picamera2_jpeg`` / ``picamera2`` -- the real JPEG
       source when ``picamera2`` is importable; otherwise it falls back to
       synthetic so the client still runs.
-    * ``auto`` (default) or anything else -- JPEG when available, else synthetic.
+    * ``auto`` (default) or anything else -- ``picamera2`` when available, else
+      UVC when ``/dev/video0`` and ffmpeg are present, else a loud synthetic
+      fallback for camera-free hosts and CI.
 
     :param env: environment mapping; defaults to ``os.environ``.
     """
     source_env = os.environ if env is None else env
     choice = source_env.get(ENV_VIDEO_SOURCE, "auto").strip().lower()
+    device = (
+        source_env.get(ENV_VIDEO_DEVICE, DEFAULT_VIDEO_DEVICE).strip()
+        or DEFAULT_VIDEO_DEVICE
+    )
 
     if choice == "synthetic":
         return SyntheticJpegSource(width=width, height=height)
+
+    if choice == "uvc":
+        print(f"[Pi Camera] source=uvc device={device}")
+        return UvcVideoSource(
+            device=device, width=uvc_width, height=uvc_height
+        )
 
     if _picamera2_available():
         return JpegVideoSource(width=width, height=height, framerate=framerate)
@@ -441,4 +783,16 @@ def select_video_source(
             f"[Pi Camera] PI_ECOSYS_VIDEO_SOURCE={choice} but picamera2 is absent; "
             "falling back to the synthetic source"
         )
+        return SyntheticJpegSource(width=width, height=height)
+
+    if _uvc_device_present(device) and _ffmpeg_available(DEFAULT_FFMPEG) is not None:
+        print(f"[Pi Camera] source=uvc device={device}")
+        return UvcVideoSource(
+            device=device, width=uvc_width, height=uvc_height
+        )
+
+    print(
+        "[Pi Camera] source=synthetic: no camera found "
+        f"({device} absent or ffmpeg missing) and picamera2 is absent"
+    )
     return SyntheticJpegSource(width=width, height=height)
