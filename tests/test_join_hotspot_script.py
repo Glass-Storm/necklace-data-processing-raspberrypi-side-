@@ -84,3 +84,63 @@ def test_script_verifies_association_and_ipv4() -> None:
 def test_script_is_strict_mode() -> None:
     """Unset variables, failing commands, and pipeline failures are fatal."""
     assert "set -euo pipefail" in _text()
+
+
+def test_usage_accepts_an_optional_security_mode() -> None:
+    """The runbook passes wpa3 explicitly; wpa2 stays the default."""
+    source = _text()
+    assert "$0 <ssid> <psk> [wpa2|wpa3]" in source
+    assert 'MODE="${3:-wpa2}"' in source
+
+
+def test_script_writes_the_wpa3_sae_block() -> None:
+    """WPA3 needs the exact SAE shape that a WPA3-SAE (H2E) AP accepts."""
+    source = _text()
+    assert "key_mgmt=SAE" in source
+    assert "sae_password=" in source
+    assert "ieee80211w=2" in source
+
+
+def test_wpa3_sae_pwe_is_global_not_inside_the_network_block() -> None:
+    """Android H2E hotspots need sae_pwe=2, and it must precede network={."""
+    source = _text()
+    assert "sae_pwe=2" in source
+    assert source.index("sae_pwe=2") < source.index("network={")
+
+
+def test_wpa2_keeps_the_psk_block() -> None:
+    """The WPA2 path must be unchanged for existing WPA2 access points."""
+    source = _text()
+    assert 'psk="%s"' in source
+    assert "key_mgmt=WPA-PSK" in source
+
+
+def test_wpa3_skips_the_netplan_dropin() -> None:
+    """A stale WPA2 netplan drop-in must not be written for a WPA3 join."""
+    source = _text()
+    netplan_guard = source.index(
+        'if [ "$MODE" = "wpa2" ] && compgen -G "/etc/netplan/*.yaml"'
+    )
+    netplan_write = source.index("netplan_tmp=")
+    supplicant_start = source.index("systemctl enable --now")
+    assert netplan_guard < netplan_write < supplicant_start
+    assert 'MODE" = "wpa3"' in source
+
+
+def test_script_always_starts_wpa_supplicant_and_reconfigures() -> None:
+    """The old netplan branch forgot this; it must run in both modes."""
+    source = _text()
+    assert source.count("systemctl enable --now") == 1
+    assert source.count('wpa_cli -i "$IFACE" reconfigure') == 1
+    assert source.index("systemctl enable --now") > source.index("netplan_tmp=")
+    assert source.index('wpa_cli -i "$IFACE" reconfigure') > source.index(
+        "systemctl enable --now"
+    )
+
+
+def test_script_ensures_a_wlan0_dhcp_network_file() -> None:
+    """Without a rendered wlan0 .network the join has no DHCP client."""
+    source = _text()
+    assert 'compgen -G "/etc/systemd/network/*wlan0*.network"' in source
+    assert "25-${IFACE}.network" in source
+    assert "DHCP=yes" in source
