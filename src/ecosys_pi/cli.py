@@ -283,7 +283,7 @@ async def _run_session(
     )
     from ecosys_pi.camera import select_video_source
     from ecosys_pi.stream import StreamClient, StreamTransportError
-    from ecosys_pi.tts import build_player
+    from ecosys_pi.tts import LatestPcmPlayer, build_player
 
     max_frames = frames if frames > 0 else None
     audio_requested = mode in ("audio", "both")
@@ -301,7 +301,7 @@ async def _run_session(
     # ONE gate is shared by the capture source and the player, so capture is
     # muted for exactly the duration of hub-synthesized playback (half-duplex).
     gate = HalfDuplexGate()
-    player = build_player(env, gate=gate)
+    player = LatestPcmPlayer(build_player(env, gate=gate))
 
     async def on_transcript(text: str) -> None:
         nonlocal received
@@ -309,9 +309,9 @@ async def _run_session(
         _emit(out, f"transcript {text}")
 
     async def on_tts_audio(pcm: bytes) -> None:
-        # Blocking subprocess playback runs off-loop; the player toggles the
-        # shared gate itself and always clears it, even on failure.
-        await asyncio.to_thread(player.play, pcm)
+        # Latest-wins handoff: a newer word replaces any pending one and this
+        # returns at once, so the gRPC reader never backs up behind playback.
+        player.submit(pcm)
 
     async def on_gesture(text: str) -> None:
         # A gesture frame is informational here: the hub speaks the meaning via
@@ -378,6 +378,9 @@ async def _run_session(
     finally:
         for task in tasks:
             task.cancel()
+        # Honoured even on cancellation: stop the playback worker before the
+        # loop-level awaits that a SIGTERM cancel can interrupt.
+        player.close()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await channel.close()

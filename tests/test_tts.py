@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import threading
+import time
 from collections.abc import Callable
 
 import pytest
@@ -21,6 +23,7 @@ from ecosys_pi.tts import (
     ENV_PLAYER,
     PCM_SAMPLE_RATE_HZ,
     AplayPlayer,
+    LatestPcmPlayer,
     PcmPlayer,
     RecordingPlayer,
     SoundDevicePlayer,
@@ -487,3 +490,119 @@ def test_no_local_synthesis_engine_remains() -> None:
     """The receive path must not synthesize speech itself."""
     for retired in ("CommandSpeaker", "build_speaker", "build_argv", "plan_for_lang"):
         assert not hasattr(tts_mod, retired), f"{retired} was not retired"
+
+
+# --- latest-wins playback: the Pi plays only the newest pending word ---------
+
+
+class BlockingFirstPlayer:
+    """A ``PcmPlayer`` whose first ``play`` blocks until an event is released."""
+
+    def __init__(self) -> None:
+        self.played: list[bytes] = []
+        self.first_started = threading.Event()
+        self.release_first = threading.Event()
+
+    def play(self, pcm: bytes) -> bool:
+        self.played.append(pcm)
+        if len(self.played) == 1:
+            self.first_started.set()
+            self.release_first.wait(timeout=5.0)
+        return True
+
+
+def _wait_until(predicate: Callable[[], bool], timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_latest_pcm_player_drops_the_pending_frame_and_plays_the_newest() -> None:
+    inner = BlockingFirstPlayer()
+    player = LatestPcmPlayer(inner)
+    first, second, third = b"first", b"second", b"third"
+    try:
+        player.submit(first)
+        assert inner.first_started.wait(2.0), "worker never started the first word"
+
+        # The worker is busy with ``first``: both later frames are submitted
+        # while queued, so the second must be replaced by the third.
+        player.submit(second)
+        player.submit(third)
+        inner.release_first.set()
+
+        assert _wait_until(lambda: len(inner.played) >= 2)
+        assert inner.played[0] == first
+        assert inner.played[-1] == third
+        assert second not in inner.played
+    finally:
+        inner.release_first.set()
+        player.close()
+
+
+def test_submit_returns_immediately_while_playback_blocks() -> None:
+    inner = BlockingFirstPlayer()
+    player = LatestPcmPlayer(inner)
+    submitted = threading.Event()
+
+    def submit_later() -> None:
+        player.submit(b"newer")
+        submitted.set()
+
+    player.submit(b"first")
+    assert inner.first_started.wait(2.0), "worker never started the first word"
+    thread = threading.Thread(target=submit_later)
+    try:
+        thread.start()
+        assert submitted.wait(1.0), "submit blocked behind the in-flight word"
+    finally:
+        inner.release_first.set()
+        thread.join(timeout=2.0)
+        player.close()
+
+
+def test_latest_pcm_player_ignores_empty_and_closes_idempotently() -> None:
+    inner = RecordingPlayer()
+    player = LatestPcmPlayer(inner)
+
+    player.submit(b"")
+    player.close()
+    player.close()
+
+    assert inner.played == []
+
+
+class ExplodingOncePlayer:
+    """Raise on the first ``play``; later buffers must still be played."""
+
+    def __init__(self) -> None:
+        self.played: list[bytes] = []
+        self.first_started = threading.Event()
+
+    def play(self, pcm: bytes) -> bool:
+        self.played.append(pcm)
+        if len(self.played) == 1:
+            self.first_started.set()
+            raise RuntimeError("backend boom")
+        return True
+
+
+def test_a_backend_failure_does_not_kill_the_worker(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    inner = ExplodingOncePlayer()
+    player = LatestPcmPlayer(inner)
+    try:
+        with caplog.at_level(logging.WARNING):
+            player.submit(b"one")
+            assert inner.first_started.wait(2.0)
+            player.submit(b"two")
+            assert _wait_until(lambda: len(inner.played) >= 2)
+
+        assert inner.played == [b"one", b"two"]
+        assert "TTS playback failed" in caplog.text
+    finally:
+        player.close()

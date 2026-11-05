@@ -50,9 +50,11 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Protocol, runtime_checkable
@@ -63,6 +65,7 @@ __all__ = [
     "PCM_SAMPLE_RATE_HZ",
     "SOUNDDEVICE_ENGINE",
     "AplayPlayer",
+    "LatestPcmPlayer",
     "PcmPlayer",
     "RecordingPlayer",
     "SoundDevicePlayer",
@@ -365,6 +368,118 @@ class RecordingPlayer:
         if pcm:
             self.played.append(pcm)
         return True
+
+
+# --- Latest-wins playback (the Pi must not queue stale words) ----------------
+
+
+class LatestPcmPlayer:
+    """A one-slot, latest-wins wrapper around another :class:`PcmPlayer`.
+
+    Why this exists
+    ---------------
+    The hub synthesizes a fresh word roughly every 0.5 s, while ``aplay`` blocks
+    the caller for the whole duration of that word. If the gRPC reader invokes
+    the backend directly for every ``tts_audio`` frame, the frames queue in the
+    Pi and the speaker plays words the user saw seconds ago. This wrapper keeps
+    at most ONE *pending* frame: a newer :meth:`submit` replaces it, and the
+    reader returns immediately. Only the word already in flight is allowed to
+    finish, so the next word heard is always the newest one.
+
+    The inner player still owns the :class:`SpeakingGate` toggling and the
+    all-device fan-out; this class only reorders/coalesces frames and moves the
+    blocking call onto a single daemon worker thread. A backend exception is
+    logged and swallowed so it can never kill the worker or the receive stream.
+
+    :param inner: the real backend whose ``play`` blocks for one word.
+    :param logger: logger for failures (warning) and dropped frames (debug).
+    :param join_timeout: best-effort seconds to wait for the worker in
+        :meth:`close`; the in-flight word may still be finishing.
+    """
+
+    def __init__(
+        self,
+        inner: PcmPlayer,
+        *,
+        logger: logging.Logger | None = None,
+        join_timeout: float = 2.0,
+    ) -> None:
+        self._inner = inner
+        self._logger = logger if logger is not None else _LOGGER
+        self._join_timeout = join_timeout
+        # One pending frame only; ``None`` is the worker's shutdown sentinel.
+        self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=1)
+        self._closed = threading.Event()
+        self._close_lock = threading.Lock()
+        self._worker = threading.Thread(
+            target=self._run,
+            name="ecosys-tts-latest-player",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def submit(self, pcm: bytes) -> None:
+        """Queue ``pcm`` as the newest word without ever blocking the caller.
+
+        An empty payload is ignored. When a frame is already pending, it is
+        dropped (at DEBUG) and replaced, so the queue never grows beyond one and
+        the oldest, never-heard word loses. The word currently playing is not
+        affected: the worker already owns it.
+        """
+        if not pcm or self._closed.is_set():
+            return
+
+        try:
+            self._queue.put_nowait(pcm)
+            return
+        except queue.Full:
+            pass
+
+        try:
+            self._queue.get_nowait()
+        except queue.Empty:  # the worker consumed it between Full and here
+            pass
+        else:
+            self._logger.debug("dropped a pending TTS frame; playing the newest")
+
+        try:
+            self._queue.put_nowait(pcm)
+        except queue.Full:
+            # Another producer won the race for the slot; its frame is newer.
+            self._logger.debug("a fresher TTS frame is already pending")
+
+    def _run(self) -> None:
+        """Drain the slot on one daemon thread until the sentinel arrives."""
+        while True:
+            pcm = self._queue.get()
+            if pcm is None or self._closed.is_set():
+                return
+            try:
+                self._inner.play(pcm)
+            except Exception as exc:  # noqa: BLE001 - playback must not kill the stream
+                self._logger.warning("TTS playback failed: %s", exc)
+
+    def close(self) -> None:
+        """Stop the worker and join it best-effort; safe to call repeatedly.
+
+        A pending (not-yet-playing) frame is discarded so shutdown does not
+        wait for a stale word; the word already playing is allowed to finish
+        within ``join_timeout``.
+        """
+        with self._close_lock:
+            if self._closed.is_set():
+                return
+            self._closed.set()
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:  # pragma: no cover - sentinel slot is now free
+                pass
+            if self._worker is not threading.current_thread():
+                self._worker.join(timeout=self._join_timeout)
 
 
 # --- Backend selection (availability + env) ---------------------------------
