@@ -50,6 +50,10 @@ src/ecosys_pi/          the hand-written client package
 src/ecosys/             the generated protobuf/gRPC stubs (see scripts/gen_proto.sh)
 proto/                  the vendored frozen .proto + PROTO_SOURCE provenance
 scripts/gen_proto.sh    regenerate the Python stubs from the vendored proto
+scripts/join-hotspot.sh join the phone hotspot on wlan0 (wpa_supplicant)
+scripts/install-systemd.sh  install the boot-time systemd unit (run once)
+scripts/ecosys-demo.sh  one-key demo restart + status + recent logs
+deploy/systemd/         the unit template and the env-file example
 tests/                  pytest suite (fake-hub + real-CLI subprocess tests)
 legacy/                 the superseded TCP/JSON + BLE scripts (reference only)
 docs/                   protocol decisions
@@ -147,25 +151,121 @@ are frozen. Informational chatter from the media/playback modules goes to
 
 ## Environment variables
 
-| Variable                       | Default                | Meaning                                                                                           |
-| ------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------- |
-| `PI_ECOSYS_HUB`                | (unset)                | `HOST:PORT` hub override. Precedence: `--hub` > `PI_ECOSYS_HUB` > default gateway. Blank = unset. |
-| `PI_ECOSYS_SSID`               | (unset)                | Hotspot SSID the Pi joins with `nmcli`.                                                           |
-| `PI_ECOSYS_HOTSPOT_PASSWORD`   | (unset)                | Hotspot WPA2/WPA3 password. A secret: redacted in `Config.__repr__`.                              |
-| `PI_ECOSYS_HUB_PORT`           | `9000`                 | Hub gRPC port appended to the gateway host.                                                       |
-| `PI_ECOSYS_WIFI_SECURITY`      | `wpa2`                 | `nmcli` key management: `wpa2` or `wpa3` (SAE).                                                   |
-| `PI_ECOSYS_ENABLE_AUDIO`       | (unset)                | Truthy (`1`/`true`/`yes`/`on`) opts into microphone upload; otherwise the necklace is video-only. |
-| `PI_ECOSYS_ENROLLMENT_SECONDS` | `8`                    | Voiceprint enrollment length (informational on the Pi).                                           |
-| `PI_ECOSYS_TTS_LANG`           | `yue`                  | Retained for compatibility; has no effect on the wire (the hub selects the voice).                |
-| `PI_ECOSYS_DEVICE_NAME`        | `socket.gethostname()` | Label sent in the `stream_open` frame; blank falls back to the hostname, then `ecosys-pi`.        |
-| `PI_ECOSYS_AUDIO_SOURCE`       | `auto`                 | `auto` / `synthetic` / `sounddevice` / `arecord`. `synthetic` is deterministic (used by tests).   |
+| Variable                       | Default                | Meaning                                                                                                                                                                                                        |
+| ------------------------------ | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PI_ECOSYS_HUB`                | (unset)                | `HOST:PORT` hub override. Precedence: `--hub` > `PI_ECOSYS_HUB` > default gateway. Blank = unset.                                                                                                              |
+| `PI_ECOSYS_SSID`               | (unset)                | Hotspot SSID the Pi joins with `nmcli`.                                                                                                                                                                        |
+| `PI_ECOSYS_HOTSPOT_PASSWORD`   | (unset)                | Hotspot WPA2/WPA3 password. A secret: redacted in `Config.__repr__`.                                                                                                                                           |
+| `PI_ECOSYS_HUB_PORT`           | `9000`                 | Hub gRPC port appended to the gateway host.                                                                                                                                                                    |
+| `PI_ECOSYS_WIFI_SECURITY`      | `wpa2`                 | `nmcli` key management: `wpa2` or `wpa3` (SAE).                                                                                                                                                                |
+| `PI_ECOSYS_ENABLE_AUDIO`       | (unset)                | Truthy (`1`/`true`/`yes`/`on`) opts into microphone upload; otherwise the necklace is video-only.                                                                                                              |
+| `PI_ECOSYS_ENROLLMENT_SECONDS` | `8`                    | Voiceprint enrollment length (informational on the Pi).                                                                                                                                                        |
+| `PI_ECOSYS_TTS_LANG`           | `yue`                  | Retained for compatibility; has no effect on the wire (the hub selects the voice).                                                                                                                             |
+| `PI_ECOSYS_DEVICE_NAME`        | `socket.gethostname()` | Label sent in the `stream_open` frame; blank falls back to the hostname, then `ecosys-pi`.                                                                                                                     |
+| `PI_ECOSYS_AUDIO_SOURCE`       | `auto`                 | `auto` / `synthetic` / `sounddevice` / `arecord`. `synthetic` is deterministic (used by tests).                                                                                                                |
 | `PI_ECOSYS_VIDEO_SOURCE`       | `auto`                 | `auto` / `synthetic` / `uvc` / `picamera2`. `uvc` is the demo path and hard-fails when its device or ffmpeg is missing; `auto` prefers picamera2, then `/dev/video0` + ffmpeg, then a loud synthetic fallback. |
-| `PI_ECOSYS_VIDEO_DEVICE`       | `/dev/video0`          | UVC/V4L2 capture node for `PI_ECOSYS_VIDEO_SOURCE=uvc` (or auto). Used by the missing-device probe. |
+| `PI_ECOSYS_VIDEO_DEVICE`       | `/dev/video0`          | UVC/V4L2 capture node for `PI_ECOSYS_VIDEO_SOURCE=uvc` (or auto). Used by the missing-device probe.                                                                                                            |
 
 > **systemd caveat.** The client reads the _process_ environment. A unit started
 > for a service user gets a fresh, minimal environment — set variables with
 > `Environment=` / `EnvironmentFile=` in the unit, or point the loader at a
 > `.env` / `config.json` file, or the defaults apply.
+
+## Run on boot (systemd) / one-key demo
+
+The client ships as a systemd unit, so it starts on boot and can be restarted
+with one command during a live demo. This is the concrete answer to the
+[systemd caveat](#environment-variables): the unit loads
+`/etc/ecosys/ecosys-client.env` with `EnvironmentFile=`, so `PI_ECOSYS_HUB` and
+the camera settings reach the process even though a service gets a minimal
+environment. The service runs **only** the client — it does not manage Wi-Fi,
+`usb0`, `eth0`, or the phone hotspot.
+
+| Path                                                                                   | Purpose                                                    |
+| -------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| [`deploy/systemd/ecosys-client.service`](deploy/systemd/ecosys-client.service)         | Unit **template** with `@REPO@` / `@PYTHON@` placeholders. |
+| [`deploy/systemd/ecosys-client.env.example`](deploy/systemd/ecosys-client.env.example) | Env-file example; contains no secrets.                     |
+| `scripts/install-systemd.sh`                                                           | Renders and installs the unit, then enables/restarts it.   |
+| `scripts/ecosys-demo.sh`                                                               | One-key restart + status + recent journal lines.           |
+
+### Install once (on the Pi)
+
+The deployed checkout is `/root/necklace` and its venv is
+`/root/necklace/.venv`; run the installer from there as root:
+
+```bash
+cd /root/necklace
+sudo ./scripts/install-systemd.sh
+```
+
+The installer renders the template with this checkout's absolute repo and venv
+paths, installs `/etc/systemd/system/ecosys-client.service` (mode 0644), creates
+`/etc/ecosys/ecosys-client.env` **only if it is absent**, then runs
+`systemctl daemon-reload`, `systemctl enable ecosys-client.service`, and
+`systemctl restart ecosys-client.service`. It is idempotent and never overwrites
+an existing env file.
+
+Point the client at the phone hotspot gateway for the demo:
+
+```bash
+sudoedit /etc/ecosys/ecosys-client.env
+```
+
+```ini
+PI_ECOSYS_HUB=10.240.85.29:9000   # edit to the phone hotspot gateway for the demo
+PI_ECOSYS_VIDEO_SOURCE=uvc
+PI_ECOSYS_VIDEO_DEVICE=/dev/video0
+PI_ECOSYS_DEVICE_NAME=ecosys-pi
+```
+
+`ExecStart` deliberately has **no `--hub`**: the CLI falls back to
+`PI_ECOSYS_HUB`, so the env file — not the unit — controls the hub address. (Note
+that systemd does not expand `${VAR}` in `ExecStart`; the CLI's own env fallback
+is what makes this work.)
+
+### Start / restart for the demo
+
+```bash
+# One key: restart the service, wait briefly, print status + the last 20 log lines.
+sudo ./scripts/ecosys-demo.sh
+
+# The same restart on its own.
+sudo systemctl restart ecosys-client
+```
+
+`ecosys-demo.sh` exits `0` only when `ecosys-client.service` is running.
+
+### Logs
+
+```bash
+journalctl -u ecosys-client -f              # follow
+journalctl -u ecosys-client -n 100 --no-pager
+```
+
+The client's frozen stdout contract (`transcript <text>` / `error: <detail>`)
+and its informational stderr chatter both land in the journal.
+
+### Troubleshooting
+
+- **Camera (`/dev/video0`).** `ExecStartPre` waits up to 60 s for the USB Y360 to
+  enumerate. If the camera never appears, the client starts anyway and reports
+  the real error; check the unit with `systemctl status ecosys-client`, confirm
+  the node with `ls -l /dev/video0`, and replug the Y360. With
+  `PI_ECOSYS_VIDEO_SOURCE=uvc` a missing device or `ffmpeg` is a hard failure, by
+  design; use `auto` only if a CSI `picamera2` camera is the intended source.
+- **Hub address.** The phone is the hotspot access point, so the hub is normally
+  the Pi's default gateway — confirm it with `ip route` on the Pi. If the phone
+  re-assigned a different address, edit `PI_ECOSYS_HUB` in
+  `/etc/ecosys/ecosys-client.env` and run `sudo systemctl restart ecosys-client`.
+- **Wi-Fi / hotspot.** The unit does not join the hotspot. Join it once with
+  [`scripts/join-hotspot.sh`](scripts/join-hotspot.sh); the unit only waits for
+  `network-online.target` and `wpa_supplicant@wlan0.service`.
+- **Restart loop.** The unit sets `StartLimitIntervalSec=0`, so a missing camera
+  or unreachable hub never exhausts the start limit. Read
+  `journalctl -u ecosys-client -n 50` for the actual cause.
+- **Repo moved or venv recreated.** The rendered unit embeds absolute paths;
+  rerun `sudo ./scripts/install-systemd.sh` after moving the checkout or
+  recreating `.venv`.
 
 ## Scope: what this branch does NOT do
 

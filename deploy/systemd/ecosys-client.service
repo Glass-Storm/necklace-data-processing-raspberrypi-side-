@@ -1,0 +1,44 @@
+# ecosys-pi client — systemd unit TEMPLATE.
+#
+# Do not copy this file to /etc/systemd/system by hand: run
+# `scripts/install-systemd.sh`, which substitutes the two path placeholders
+# below and installs the rendered unit. The deployed repo is /root/necklace on
+# the Pi.
+#
+# The client reads its settings from the PROCESS environment. systemd starts a
+# service with a fresh, minimal environment, so the hub address and camera
+# settings come from EnvironmentFile below — never from a login shell (see the
+# "systemd caveat" in README.md).
+#
+# systemd does NOT expand ${VAR} in ExecStart; the CLI's own PI_ECOSYS_HUB
+# fallback reads the variable from the environment file instead.
+
+[Unit]
+Description=ecosys.v1 Raspberry Pi client (video peer)
+Documentation=file:@REPO@/README.md
+After=network-online.target wpa_supplicant@wlan0.service
+Wants=network-online.target
+# Keep restarting forever: a camera/hub glitch during a demo must not leave the
+# unit in a failed state with the start limit exhausted.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@REPO@
+Environment=PYTHONUNBUFFERED=1
+# The leading '-' keeps the unit runnable when the file is absent (defaults
+# apply). Never add secrets to this unit; keep them in the env file.
+EnvironmentFile=-/etc/ecosys/ecosys-client.env
+# Wait (bounded) for the USB Y360 to enumerate. Exit 0 when it never appears so
+# the client can report the real camera error instead of a fast restart loop.
+ExecStartPre=/bin/sh -c 'i=0; while [ ! -e /dev/video0 ] && [ "$$i" -lt 60 ]; do sleep 1; i=$$((i+1)); done; if [ ! -e /dev/video0 ]; then echo "ecosys-client: /dev/video0 absent after 60s; starting anyway" >&2; fi'
+ExecStart=@PYTHON@ -m ecosys_pi --mode video --frames 0
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
