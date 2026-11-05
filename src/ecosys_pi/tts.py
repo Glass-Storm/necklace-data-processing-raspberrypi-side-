@@ -14,6 +14,10 @@ Two playback backends, chosen by ``PI_ECOSYS_PLAYER``:
 * ``aplay -f S16_LE -r 16000 -c 1`` (ALSA ``alsa-utils``), with the PCM fed on
   stdin. This is the default on a Raspberry Pi: it needs no Python audio stack
   and consumes the exact wire format (signed 16-bit little-endian, mono, 16 kHz).
+  Playback fans out concurrently to every PCM device that advertises playback
+  streams in ``/proc/asound/pcm`` (``-D plughw:<card>,<device>``) so a speaker
+  and USB earphones both sound; when no device is enumerable it falls back to
+  one default ``aplay`` with no ``-D``.
 * ``sounddevice`` (PortAudio) as a Python fallback when ``aplay`` is absent.
 
 ``PI_ECOSYS_PLAYER=none`` selects :class:`RecordingPlayer`, which records the PCM
@@ -46,9 +50,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Protocol, runtime_checkable
 
 __all__ = [
@@ -62,6 +68,7 @@ __all__ = [
     "SoundDevicePlayer",
     "SpeakingGate",
     "build_player",
+    "playback_devices",
     "player_choice",
 ]
 
@@ -79,6 +86,38 @@ SOUNDDEVICE_ENGINE = "sounddevice"
 #: Environment variable selecting the playback backend: ``auto`` (default),
 #: ``aplay``, ``sounddevice``, or ``none``.
 ENV_PLAYER = "PI_ECOSYS_PLAYER"
+
+#: ALSA's per-host PCM inventory, one ``CC-DD: name : playback N`` per device.
+ASOUND_PCM_PATH = "/proc/asound/pcm"
+
+#: One ``/proc/asound/pcm`` line: ``card``-``device``, then feature counts.
+_ASOUND_PCM_LINE = re.compile(
+    r"^(?P<card>\d+)-(?P<device>\d+):.*\bplayback\s+(?P<streams>\d+)"
+)
+
+
+def playback_devices(
+    path: str | os.PathLike[str] = ASOUND_PCM_PATH,
+) -> list[tuple[int, int]]:
+    """Return every ALSA PCM ``(card, device)`` that can play, in file order.
+
+    Parses the ALSA inventory (``/proc/asound/pcm``) and keeps lines whose
+    ``playback N`` count is greater than zero, so capture-only devices are
+    skipped. A missing or unreadable inventory yields an empty list, which the
+    :class:`AplayPlayer` turns into the legacy default-device fallback.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return []
+
+    devices: list[tuple[int, int]] = []
+    for line in lines:
+        match = _ASOUND_PCM_LINE.match(line)
+        if match is not None and int(match.group("streams")) > 0:
+            devices.append((int(match.group("card")), int(match.group("device"))))
+    return devices
 
 
 # --- Half-duplex gate contract ----------------------------------------------
@@ -140,6 +179,11 @@ def _stderr_text(value: object) -> str:
 class AplayPlayer:
     """Play PCM16 @ 16 kHz via ``aplay`` with the bytes on stdin.
 
+    Playback fans out to every device returned by :attr:`devices`, one
+    ``aplay -D plughw:<card>,<device>`` per target, concurrently; a device that
+    fails is logged and does not abort the others. An empty device list falls
+    back to a single default ``aplay`` with no ``-D``.
+
     The process runner and the which-lookup are **injected** so tests can assert
     the exact argv and simulate a missing binary without ever invoking audio.
 
@@ -149,6 +193,8 @@ class AplayPlayer:
     :param gate: half-duplex flag flipped ``True``/``False`` around playback.
     :param logger: logger for the "aplay missing"/failure warnings.
     :param sample_rate: PCM sample rate for ``-r`` (the frozen 16 kHz).
+    :param devices: enumerates the playback ``(card, device)`` targets; defaults
+        to :func:`playback_devices` (never called in tests).
     """
 
     def __init__(
@@ -159,27 +205,54 @@ class AplayPlayer:
         gate: SpeakingGate | None = None,
         logger: logging.Logger | None = None,
         sample_rate: int = PCM_SAMPLE_RATE_HZ,
+        devices: Callable[[], Sequence[tuple[int, int]]] | None = None,
     ) -> None:
         self._runner = runner if runner is not None else subprocess.run
         self._which = which if which is not None else shutil.which
         self._gate = gate
         self._logger = logger if logger is not None else _LOGGER
         self._sample_rate = sample_rate
+        self._devices = devices if devices is not None else playback_devices
 
-    def _argv(self) -> list[str]:
+    def _argv(self, device: tuple[int, int] | None = None) -> list[str]:
         """The exact ``aplay`` argv for the frozen mono/PCM16/16 kHz format."""
-        return [
-            APLAY_ENGINE,
-            "-f",
-            "S16_LE",
-            "-r",
-            str(self._sample_rate),
-            "-c",
-            "1",
-        ]
+        argv = [APLAY_ENGINE]
+        if device is not None:
+            argv.extend(["-D", f"plughw:{device[0]},{device[1]}"])
+        argv.extend(["-f", "S16_LE", "-r", str(self._sample_rate), "-c", "1"])
+        return argv
+
+    def _play_on(self, pcm: bytes, device: tuple[int, int] | None) -> bool:
+        """Run one ``aplay``; return whether it accepted the whole buffer."""
+        target = "default" if device is None else f"plughw:{device[0]},{device[1]}"
+        try:
+            completed = self._runner(
+                self._argv(device), input=pcm, check=False, capture_output=True
+            )
+        except OSError as exc:
+            self._logger.warning(
+                "%s could not start on %s: %s (install alsa-utils)",
+                APLAY_ENGINE,
+                target,
+                exc,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 - playback must not kill the stream
+            self._logger.warning("%s failed on %s: %s", APLAY_ENGINE, target, exc)
+            return False
+        if completed.returncode != 0:
+            self._logger.warning(
+                "%s exited %s on %s: %s",
+                APLAY_ENGINE,
+                completed.returncode,
+                target,
+                _stderr_text(completed.stderr).strip(),
+            )
+            return False
+        return True
 
     def play(self, pcm: bytes) -> bool:
-        """Play ``pcm`` through ``aplay``; warn and return ``False`` on failure."""
+        """Play ``pcm`` on every device; warn and return ``False`` if all fail."""
         if not pcm:
             return True
 
@@ -191,26 +264,19 @@ class AplayPlayer:
             )
             return False
 
-        # The gate toggles exactly once around the playback window.
+        targets: list[tuple[int, int] | None] = list(self._devices()) or [None]
+
+        # The gate toggles exactly once around the whole playback window.
         _begin(self._gate)
         try:
-            completed = self._runner(
-                self._argv(), input=pcm, check=False, capture_output=True
-            )
-            if completed.returncode != 0:
-                self._logger.warning(
-                    "%s exited %s: %s",
-                    APLAY_ENGINE,
-                    completed.returncode,
-                    _stderr_text(completed.stderr).strip(),
-                )
-                return False
-            return True
-        except OSError as exc:
-            self._logger.warning(
-                "%s could not start: %s (install alsa-utils)", APLAY_ENGINE, exc
-            )
-            return False
+            if len(targets) == 1:
+                return self._play_on(pcm, targets[0])
+            results: list[bool] = []
+            with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+                futures = [pool.submit(self._play_on, pcm, d) for d in targets]
+                for future in as_completed(futures):
+                    results.append(future.result())
+            return any(results)
         finally:
             _end(self._gate)
 

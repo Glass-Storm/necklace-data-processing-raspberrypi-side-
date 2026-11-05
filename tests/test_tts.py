@@ -26,6 +26,7 @@ from ecosys_pi.tts import (
     SoundDevicePlayer,
     SpeakingGate,
     build_player,
+    playback_devices,
     player_choice,
 )
 
@@ -71,7 +72,9 @@ def test_aplay_sample_rate_constant_is_16k() -> None:
 
 def test_aplay_player_uses_exact_argv_and_feeds_pcm_on_stdin() -> None:
     runner = RecordingRunner()
-    player = AplayPlayer(runner=runner, which=_which_returning("/usr/bin/aplay"))
+    player = AplayPlayer(
+        runner=runner, which=_which_returning("/usr/bin/aplay"), devices=lambda: []
+    )
 
     assert player.play(PCM) is True
     assert runner.calls == [[APLAY_ENGINE, "-f", "S16_LE", "-r", "16000", "-c", "1"]]
@@ -84,6 +87,128 @@ def test_blank_pcm_is_a_noop() -> None:
 
     assert player.play(b"") is True
     assert runner.calls == []
+
+
+# --- device enumeration: every playback PCM, skip capture-only --------------
+
+
+ASOUND_PCM_FIXTURE = """\
+00-00: bcm2835 Headphones : bcm2835 Headphones : playback 8
+01-00: MAI PCM i2s-hifi-0 : MAI PCM i2s-hifi-0 : playback 1
+02-00: MAI PCM i2s-hifi-0 : MAI PCM i2s-hifi-0 : playback 1
+03-00: USB Audio : USB Audio : capture 1
+04-00: USB Audio : USB Audio : playback 1 : capture 1
+"""
+
+
+def test_playback_devices_parses_fixture_and_skips_capture_only(tmp_path) -> None:
+    path = tmp_path / "pcm"
+    path.write_text(ASOUND_PCM_FIXTURE)
+
+    assert playback_devices(path) == [(0, 0), (1, 0), (2, 0), (4, 0)]
+
+
+def test_playback_devices_missing_inventory_is_empty(tmp_path) -> None:
+    assert playback_devices(tmp_path / "missing") == []
+
+
+def test_playback_devices_empty_inventory_is_empty(tmp_path) -> None:
+    path = tmp_path / "pcm"
+    path.write_text("")
+
+    assert playback_devices(path) == []
+
+
+# --- fan-out: one aplay per playback device, concurrently -------------------
+
+
+def test_aplay_player_fans_out_to_every_device() -> None:
+    runner = RecordingRunner()
+    player = AplayPlayer(
+        runner=runner,
+        which=_which_returning("/usr/bin/aplay"),
+        devices=lambda: [(0, 0), (4, 0)],
+    )
+
+    assert player.play(PCM) is True
+    assert sorted(runner.calls) == sorted(
+        [
+            [
+                APLAY_ENGINE,
+                "-D",
+                "plughw:0,0",
+                "-f",
+                "S16_LE",
+                "-r",
+                "16000",
+                "-c",
+                "1",
+            ],
+            [
+                APLAY_ENGINE,
+                "-D",
+                "plughw:4,0",
+                "-f",
+                "S16_LE",
+                "-r",
+                "16000",
+                "-c",
+                "1",
+            ],
+        ]
+    )
+    assert runner.inputs.count(PCM) == 2
+
+
+class DeviceFailingRunner:
+    """Fail exactly the ``plughw:4,0`` target with a noisy stderr."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.inputs: list[bytes | None] = []
+
+    def __call__(self, argv, **kwargs):  # type: ignore[no-untyped-def]
+        self.calls.append(list(argv))
+        self.inputs.append(kwargs.get("input"))
+        failing = "plughw:4,0" in argv
+        return subprocess.CompletedProcess(
+            argv,
+            1 if failing else 0,
+            stdout=b"",
+            stderr=b"device busy" if failing else b"",
+        )
+
+
+def test_one_device_failure_does_not_abort_the_others(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = DeviceFailingRunner()
+    player = AplayPlayer(
+        runner=runner,
+        which=_which_returning("/usr/bin/aplay"),
+        devices=lambda: [(0, 0), (4, 0)],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert player.play(PCM) is True
+
+    assert len(runner.calls) == 2
+    assert runner.inputs.count(PCM) == 2
+    assert "plughw:4,0" in caplog.text
+    assert "device busy" in caplog.text
+
+
+def test_empty_device_list_falls_back_to_default_argv() -> None:
+    runner = RecordingRunner()
+    player = AplayPlayer(
+        runner=runner,
+        which=_which_returning("/usr/bin/aplay"),
+        devices=lambda: [],
+    )
+
+    assert player.play(PCM) is True
+    assert runner.calls == [[APLAY_ENGINE, "-f", "S16_LE", "-r", "16000", "-c", "1"]]
+    assert runner.inputs == [PCM]
 
 
 # --- missing backend -> warn, never crash the stream -------------------------
@@ -149,6 +274,7 @@ def test_gate_is_true_during_playback_and_false_after() -> None:
         runner=observing_runner,
         which=_which_returning("/usr/bin/aplay"),
         gate=gate,
+        devices=lambda: [],
     )
 
     assert gate.speaking is False
@@ -192,6 +318,7 @@ def test_gate_toggles_exactly_once_per_playback() -> None:
         runner=RecordingRunner(),
         which=_which_returning("/usr/bin/aplay"),
         gate=TracingGate(),
+        devices=lambda: [(0, 0), (4, 0)],
     )
 
     player.play(PCM)
