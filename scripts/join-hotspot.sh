@@ -5,7 +5,14 @@
 #
 # The security mode defaults to wpa2. Use wpa3 for a WPA3-SAE (H2E) access
 # point (for example an Android "WPA3-Personal" hotspot); wpa2 keeps the
-# original WPA-PSK block.
+# original WPA-PSK network block.
+#
+# The script is additive and remembers every network it has joined: an
+# existing wpa_supplicant-wlan0.conf is never overwritten. The requested SSID
+# is updated in place when already present, or appended as a new network block
+# otherwise, through wpa_cli + save_config. wpa_supplicant therefore
+# auto-connects to whichever remembered network is available at boot and after
+# a reconnect.
 #
 # This script is for a Pi running systemd-networkd + wpa_supplicant and no
 # nmcli. It configures ONLY wlan0. The usb0 and eth0 interfaces are the lab
@@ -16,15 +23,23 @@
 # rendered and picked up with `networkctl reload`, which keeps existing links
 # (including usb0/eth0) up.
 #
-# The PSK is written only to a root-owned, mode-600 file. It is never echoed,
-# logged, or placed in a repository file.
+# The script's own historical netplan drop-in is ALWAYS removed and
+# netplan-wpa-wlan0 is stopped, because otherwise it starts a second
+# wpa_supplicant at boot, holds the wlan0 control interface, and makes
+# wpa_supplicant@wlan0 fail with "ctrl_iface exists" (status 255). This script
+# never writes a netplan drop-in.
+#
+# The PSK is written only to a root-owned, mode-600 file. The SSID and PSK are
+# never echoed, logged, or placed in a repository file.
 
 set -euo pipefail
+umask 077
 
 readonly IFACE="wlan0"
 readonly WPA_CONF="/etc/wpa_supplicant/wpa_supplicant-${IFACE}.conf"
 readonly NETWORK_FILE="/etc/systemd/network/25-${IFACE}.network"
 readonly NETPLAN_DROPIN="/etc/netplan/90-ecosys-${IFACE}.yaml"
+readonly NETPLAN_UNIT="netplan-wpa-${IFACE}.service"
 readonly MANAGEMENT_IFACES=("usb0" "eth0")
 # Regulatory country for the station. Override with ECOSYS_COUNTRY if needed.
 readonly COUNTRY="${ECOSYS_COUNTRY:-US}"
@@ -55,11 +70,11 @@ esac
 
 case "$SSID" in
 "") die "SSID must not be empty" ;;
-*$'\n'* | *$'\r'*) die "SSID must not contain a newline" ;;
+*$'\n'* | *$'\r'* | *$'\t'*) die "SSID must not contain control characters" ;;
 esac
 case "$PSK" in
 "") die "PSK must not be empty" ;;
-*$'\n'* | *$'\r'*) die "PSK must not contain a newline" ;;
+*$'\n'* | *$'\r'* | *$'\t'*) die "PSK must not contain control characters" ;;
 esac
 
 # Refuse to configure a management link even if a future caller changes IFACE.
@@ -75,23 +90,16 @@ fi
 
 # Missing tooling is a named failure, not a half-applied network change.
 missing_tools=()
-for tool in ip wpa_cli wpa_supplicant mktemp networkctl systemctl; do
+for tool in ip wpa_cli wpa_supplicant mktemp networkctl systemctl awk grep; do
 	if ! command -v "$tool" >/dev/null 2>&1; then
 		missing_tools+=("$tool")
 	fi
 done
-# netplan is only consulted for the WPA2 path; the WPA3 path deliberately
-# leaves netplan alone so a stale WPA2 drop-in cannot override the SAE config.
-if [ "$MODE" = "wpa2" ] && compgen -G "/etc/netplan/*.yaml" >/dev/null; then
-	if ! command -v netplan >/dev/null 2>&1; then
-		missing_tools+=("netplan")
-	fi
-fi
 if [ "${#missing_tools[@]}" -gt 0 ]; then
 	die "missing required tool(s): ${missing_tools[*]}"
 fi
 
-# Escape a value for a double-quoted wpa_supplicant/netplan string.
+# Escape a value for a double-quoted wpa_supplicant string.
 escape_value() {
 	local value="$1"
 	value="${value//\\/\\\\}"
@@ -131,36 +139,71 @@ verify_management_links() {
 # Always assert the management link survived, including on verification failure.
 trap 'verify_management_links' EXIT
 
-# 1. Write the wpa_supplicant configuration. mktemp + mv keeps it 0600 even if
-# the destination already exists with looser permissions.
+# Insert a global option before the first network block, preserving every
+# existing network block. A no-op when the option is already present.
+ensure_global_option() {
+	local key="$1" line="$2" tmp
+	if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$WPA_CONF"; then
+		return 0
+	fi
+	tmp="$(mktemp /etc/wpa_supplicant/.wpa_supplicant-wlan0.XXXXXX)"
+	chmod 600 "$tmp"
+	awk -v line="$line" '
+		/^[[:space:]]*network[[:space:]]*=/ && !inserted { print line; inserted = 1 }
+		{ print }
+		END { if (!inserted) print line }
+	' "$WPA_CONF" >"$tmp"
+	mv "$tmp" "$WPA_CONF"
+	chmod 600 "$WPA_CONF"
+}
+
+# 1. Remove the script's own stale netplan drop-in and stop the netplan
+# supplicant. Left in place, netplan-wpa-wlan0 starts its own wpa_supplicant at
+# boot, holds the wlan0 control interface, and wpa_supplicant@wlan0 fails with
+# "ctrl_iface exists" (status 255), so the Pi never auto-connects. This script
+# never writes a netplan drop-in in either mode.
+if [ -e "$NETPLAN_DROPIN" ]; then
+	rm -f "$NETPLAN_DROPIN"
+fi
+if command -v netplan >/dev/null 2>&1; then
+	# Drop the rendered /run/netplan/wpa-wlan0.conf that came from the drop-in.
+	netplan generate || die "netplan generate failed after removing ${NETPLAN_DROPIN}"
+fi
+systemctl stop "$NETPLAN_UNIT" >/dev/null 2>&1 || true
+
+# 2. Create the base configuration only when it is absent. An existing file is
+# never overwritten: its network blocks are what make the Pi remember every
+# network it has joined. mktemp + mv keeps it 0600 even if the destination
+# already exists with looser permissions.
 mkdir -p /etc/wpa_supplicant
-wpa_tmp="$(mktemp /etc/wpa_supplicant/.wpa_supplicant-wlan0.XXXXXX)"
-chmod 600 "$wpa_tmp"
-{
-	printf 'ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n'
-	printf 'update_config=1\n'
-	printf 'country=%s\n' "$COUNTRY"
-	if [ "$MODE" = "wpa3" ]; then
-		# Global SAE option: H2E (hash-to-element) is what Android WPA3
-		# hotspots negotiate. It must sit outside the network block.
-		printf 'sae_pwe=2\n'
-	fi
-	printf '\nnetwork={\n'
-	printf '\tssid="%s"\n' "$(escape_value "$SSID")"
-	if [ "$MODE" = "wpa3" ]; then
-		printf '\tkey_mgmt=SAE\n'
-		printf '\tsae_password="%s"\n' "$(escape_value "$PSK")"
-		printf '\tieee80211w=2\n'
-	else
-		printf '\tpsk="%s"\n' "$(escape_value "$PSK")"
-		printf '\tkey_mgmt=WPA-PSK\n'
-	fi
-	printf '}\n'
-} >"$wpa_tmp"
-mv "$wpa_tmp" "$WPA_CONF"
+if [ ! -f "$WPA_CONF" ]; then
+	wpa_tmp="$(mktemp /etc/wpa_supplicant/.wpa_supplicant-wlan0.XXXXXX)"
+	chmod 600 "$wpa_tmp"
+	{
+		printf 'ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n'
+		printf 'update_config=1\n'
+		printf 'country=%s\n' "$COUNTRY"
+		if [ "$MODE" = "wpa3" ]; then
+			# Global SAE option: H2E (hash-to-element) is what Android WPA3
+			# hotspots negotiate. It must sit outside the network block.
+			printf 'sae_pwe=2\n'
+		fi
+	} >"$wpa_tmp"
+	mv "$wpa_tmp" "$WPA_CONF"
+fi
 chmod 600 "$WPA_CONF"
 
-# 2. Ensure a systemd-networkd DHCP unit exists for wlan0. This is independent
+# A config written by an older run may lack the globals required by
+# save_config and SAE. Insert them before the first network block so the
+# remembered networks stay untouched.
+ensure_global_option ctrl_interface 'ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev'
+ensure_global_option update_config 'update_config=1'
+ensure_global_option country "country=${COUNTRY}"
+if [ "$MODE" = "wpa3" ]; then
+	ensure_global_option sae_pwe 'sae_pwe=2'
+fi
+
+# 3. Ensure a systemd-networkd DHCP unit exists for wlan0. This is independent
 # of netplan: the box may have no rendered wlan0 .network at all.
 mkdir -p /etc/systemd/network
 if ! compgen -G "/etc/systemd/network/*wlan0*.network" >/dev/null; then
@@ -175,41 +218,69 @@ if ! compgen -G "/etc/systemd/network/*wlan0*.network" >/dev/null; then
 	mv "$network_tmp" "$NETWORK_FILE"
 fi
 
-# 3. WPA2 on a netplan-managed host still uses a drop-in (the historical
-# path). WPA3 deliberately does not: a leftover WPA2 drop-in would render a
-# PSK config that conflicts with the SAE file written above.
-if [ "$MODE" = "wpa2" ] && compgen -G "/etc/netplan/*.yaml" >/dev/null; then
-	netplan_tmp="$(mktemp /etc/netplan/.90-ecosys-wlan0.XXXXXX)"
-	chmod 600 "$netplan_tmp"
-	{
-		printf 'network:\n'
-		printf '  version: 2\n'
-		printf '  wifis:\n'
-		printf '    %s:\n' "$IFACE"
-		printf '      dhcp4: true\n'
-		printf '      access-points:\n'
-		printf '        "%s":\n' "$(escape_value "$SSID")"
-		printf '          password: "%s"\n' "$(escape_value "$PSK")"
-	} >"$netplan_tmp"
-	mv "$netplan_tmp" "$NETPLAN_DROPIN"
-	chmod 600 "$NETPLAN_DROPIN"
-	# `networkctl reload` alone does NOT render netplan YAML, so generate first.
-	netplan generate
+# 4. Make wpa_supplicant@wlan0 the only wlan0 supplicant. A stale control
+# socket from a crashed or netplan-owned supplicant blocks startup, so drop it
+# while the unit is inactive. Restart (not just enable --now) so a config
+# edited above is re-read by a unit that was already running.
+if ! systemctl is-active --quiet "wpa_supplicant@${IFACE}"; then
+	rm -f "/run/wpa_supplicant/${IFACE}" "/var/run/wpa_supplicant/${IFACE}"
+	systemctl reset-failed "wpa_supplicant@${IFACE}" >/dev/null 2>&1 || true
 fi
+systemctl enable "wpa_supplicant@${IFACE}" >/dev/null
+ip link set "$IFACE" up >/dev/null 2>&1 || true
+systemctl restart "wpa_supplicant@${IFACE}"
 
-# 4. ALWAYS start the per-interface unit and reload networkd in BOTH modes.
-# `enable --now` does not restart an already-running unit, so explicitly ask
-# wpa_supplicant to re-read the new file below. This is the step the old
-# netplan branch skipped, leaving wlan0 without a supplicant.
-systemctl enable --now "wpa_supplicant@${IFACE}"
+# Wait for the control interface before issuing wpa_cli commands.
+ctrl_deadline=$((SECONDS + 10))
+until wpa_cli -i "$IFACE" ping >/dev/null 2>&1; do
+	if [ "$SECONDS" -ge "$ctrl_deadline" ]; then
+		die "wpa_supplicant@${IFACE} did not open its control interface"
+	fi
+	sleep 1
+done
 
 # Reload the rendered networkd configuration without dropping any link.
 networkctl reload
 
-# If the service was already running, make it re-read the new configuration.
-wpa_cli -i "$IFACE" reconfigure >/dev/null 2>&1 || true
+# 5. Add or update the requested network through wpa_cli. list_networks is
+# captured, never printed, so the SSID never reaches stdout. Existing network
+# blocks stay as they are, which is what makes the Pi remember every network.
+wpa_command() {
+	local action="$1" result
+	shift
+	result="$(wpa_cli -i "$IFACE" "$action" "$@" 2>/dev/null | tail -n 1 || true)"
+	if [ "$result" != "OK" ]; then
+		die "wpa_cli ${action} failed"
+	fi
+}
 
-# 5. Verify association and DHCP before claiming success.
+networks="$(wpa_cli -i "$IFACE" list_networks 2>/dev/null || true)"
+network_id="$(printf '%s\n' "$networks" | SSID="$SSID" awk -F '\t' \
+	'$1 ~ /^[0-9]+$/ && $2 == ENVIRON["SSID"] { print $1; exit }')"
+
+if [ -z "$network_id" ]; then
+	network_id="$(wpa_cli -i "$IFACE" add_network 2>/dev/null | tail -n 1 || true)"
+	case "$network_id" in
+	'' | *[!0-9]*) die "could not add a wpa_supplicant network" ;;
+	esac
+fi
+
+wpa_command set_network "$network_id" ssid "\"$(escape_value "$SSID")\""
+if [ "$MODE" = "wpa3" ]; then
+	wpa_command set_network "$network_id" key_mgmt SAE
+	wpa_command set_network "$network_id" sae_password "\"$(escape_value "$PSK")\""
+	wpa_command set_network "$network_id" ieee80211w 2
+else
+	wpa_command set_network "$network_id" psk "\"$(escape_value "$PSK")\""
+	wpa_command set_network "$network_id" key_mgmt WPA-PSK
+fi
+wpa_command enable_network "$network_id"
+wpa_command save_config
+# wpa_supplicant rewrites the file with its own umask; re-tighten it here.
+chmod 600 "$WPA_CONF"
+wpa_command reconfigure
+
+# 6. Verify association and DHCP before claiming success.
 status=""
 deadline=$((SECONDS + VERIFY_TIMEOUT_S))
 while [ "$SECONDS" -lt "$deadline" ]; do
@@ -235,9 +306,9 @@ if [ -z "$wpa_state" ] || ! printf '%s\n' "$wpa_state" | grep -q 'COMPLETED' || 
 			tail -n 1 || true)"
 	fi
 	if [ -n "$journal_hint" ]; then
-		die "wrong PSK or association rejected for SSID '${SSID}': ${journal_hint}"
+		die "wrong PSK or association rejected for the configured SSID: ${journal_hint}"
 	fi
-	die "wlan0 did not associate with SSID '${SSID}' (${wpa_state:-wpa_state=unknown}, ${ipv4:-no IPv4}); check the PSK and that the phone hotspot is on"
+	die "wlan0 did not associate with the configured SSID (${wpa_state:-wpa_state=unknown}, ${ipv4:-no IPv4}); check the PSK and that the phone hotspot is on"
 fi
 
 if [ -n "$BASELINE_MANAGEMENT_LINKS" ]; then
@@ -246,6 +317,6 @@ else
 	management_note="none had an IPv4 before the join"
 fi
 
-echo "join-hotspot: ${IFACE} joined '${SSID}' (${wpa_state}, ${MODE})"
+echo "join-hotspot: ${IFACE} associated (${wpa_state}, ${MODE}, network id ${network_id})"
 echo "join-hotspot: ${IFACE} ${ipv4}"
 echo "join-hotspot: management links intact: ${management_note}"

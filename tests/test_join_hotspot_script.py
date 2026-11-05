@@ -65,6 +65,10 @@ def test_script_writes_the_wpa_supplicant_config_mode_600() -> None:
     assert "ctrl_interface=" in source
     assert "country=" in source
     assert "chmod 600" in source
+    # save_config rewrites the file with wpa_supplicant's umask, so the mode is
+    # re-tightened after the save.
+    save_call = source.index("wpa_command save_config")
+    assert source.index('chmod 600 "$WPA_CONF"', save_call) > save_call
 
 
 def test_script_never_restarts_systemd_networkd_wholesale() -> None:
@@ -93,49 +97,76 @@ def test_usage_accepts_an_optional_security_mode() -> None:
     assert 'MODE="${3:-wpa2}"' in source
 
 
-def test_script_writes_the_wpa3_sae_block() -> None:
+def test_script_writes_the_wpa3_sae_fields() -> None:
     """WPA3 needs the exact SAE shape that a WPA3-SAE (H2E) AP accepts."""
     source = _text()
-    assert "key_mgmt=SAE" in source
-    assert "sae_password=" in source
-    assert "ieee80211w=2" in source
+    assert "key_mgmt SAE" in source
+    assert "sae_password" in source
+    assert "ieee80211w 2" in source
 
 
-def test_wpa3_sae_pwe_is_global_not_inside_the_network_block() -> None:
-    """Android H2E hotspots need sae_pwe=2, and it must precede network={."""
+def test_wpa3_sae_pwe_is_a_global_option_not_a_network_parameter() -> None:
+    """Android H2E hotspots need sae_pwe=2 as a global, not per-network."""
     source = _text()
     assert "sae_pwe=2" in source
-    assert source.index("sae_pwe=2") < source.index("network={")
+    for line in source.splitlines():
+        if "sae_pwe" in line:
+            assert "set_network" not in line
+    # Global options are read when the supplicant starts.
+    assert source.index("sae_pwe=2") < source.index("systemctl restart")
 
 
-def test_wpa2_keeps_the_psk_block() -> None:
-    """The WPA2 path must be unchanged for existing WPA2 access points."""
+def test_wpa2_keeps_the_psk_mode() -> None:
+    """The WPA2 path must stay WPA-PSK for existing WPA2 access points."""
     source = _text()
-    assert 'psk="%s"' in source
-    assert "key_mgmt=WPA-PSK" in source
+    assert 'set_network "$network_id" psk' in source
+    assert "key_mgmt WPA-PSK" in source
 
 
-def test_wpa3_skips_the_netplan_dropin() -> None:
-    """A stale WPA2 netplan drop-in must not be written for a WPA3 join."""
+def test_script_removes_the_netplan_dropin_and_stops_the_conflict() -> None:
+    """The stale netplan drop-in and its supplicant must never survive."""
     source = _text()
-    netplan_guard = source.index(
-        'if [ "$MODE" = "wpa2" ] && compgen -G "/etc/netplan/*.yaml"'
+    assert 'NETPLAN_DROPIN="/etc/netplan/90-ecosys-${IFACE}.yaml"' in source
+    assert 'rm -f "$NETPLAN_DROPIN"' in source
+    assert 'NETPLAN_UNIT="netplan-wpa-${IFACE}.service"' in source
+    assert 'systemctl stop "$NETPLAN_UNIT"' in source
+    # The conflicting supplicant is stopped before ours is (re)started.
+    assert source.index('systemctl stop "$NETPLAN_UNIT"') < source.index(
+        "systemctl restart"
     )
-    netplan_write = source.index("netplan_tmp=")
-    supplicant_start = source.index("systemctl enable --now")
-    assert netplan_guard < netplan_write < supplicant_start
-    assert 'MODE" = "wpa3"' in source
+
+
+def test_script_never_writes_a_netplan_dropin() -> None:
+    """The script must not recreate the boot-time supplicant conflict."""
+    source = _text()
+    assert "netplan_tmp" not in source
+    assert "access-points" not in source
+    assert '>"$NETPLAN_DROPIN"' not in source
+
+
+def test_script_preserves_existing_networks_through_wpa_cli() -> None:
+    """Multi-network memory: update in place or append, never replace the file."""
+    source = _text()
+    for command in (
+        "list_networks",
+        "add_network",
+        "enable_network",
+        "save_config",
+        "reconfigure",
+    ):
+        assert command in source
+    # The target SSID is matched before a new block is added.
+    assert 'ENVIRON["SSID"]' in source
+    assert "set_network" in source
 
 
 def test_script_always_starts_wpa_supplicant_and_reconfigures() -> None:
     """The old netplan branch forgot this; it must run in both modes."""
     source = _text()
-    assert source.count("systemctl enable --now") == 1
-    assert source.count('wpa_cli -i "$IFACE" reconfigure') == 1
-    assert source.index("systemctl enable --now") > source.index("netplan_tmp=")
-    assert source.index('wpa_cli -i "$IFACE" reconfigure') > source.index(
-        "systemctl enable --now"
-    )
+    assert "systemctl enable" in source
+    assert source.count("systemctl restart") == 1
+    assert source.count("wpa_command reconfigure") == 1
+    assert source.index("systemctl restart") < source.index("wpa_command reconfigure")
 
 
 def test_script_ensures_a_wlan0_dhcp_network_file() -> None:
