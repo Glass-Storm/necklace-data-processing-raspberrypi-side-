@@ -1,0 +1,388 @@
+name: Release
+
+# Publishing path for the Pi peer: every `v*` tag builds a native linux/arm64
+# PyInstaller binary on a GitHub-hosted arm64 runner, verifies it is a real
+# aarch64 ELF that can print --help, and attaches it (plus a checksum and a
+# systemd-ready tarball) to a public GitHub release.
+#
+# No physical Raspberry Pi, SSH, or usb0 is involved: the artifact is built and
+# smoke-tested entirely in CI.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build linux/arm64 release
+    # Native GitHub-hosted arm64 runner. If this label is ever unavailable the
+    # workflow will fail loudly rather than silently publish an x86_64 binary;
+    # the manual fallback is an `ubuntu-latest` job running the same commands
+    # inside `arm64v8/python:3.12` after `docker/setup-qemu-action@v3`.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout the tagged commit
+        uses: actions/checkout@v4
+
+      - name: Verify the runner is aarch64
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          echo "uname -m: ${arch}"
+          test "${arch}" = "aarch64"
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # libportaudio2 -> sounddevice's PortAudio runtime
+          # ffmpeg        -> UVC camera capture
+          # alsa-utils    -> aplay playback path
+          # libcap-dev / build-essential -> python-prctl (extra `pi` dependency)
+          sudo apt-get install -y \
+            libportaudio2 \
+            ffmpeg \
+            alsa-utils \
+            libcap-dev \
+            build-essential \
+            file
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python and all project dependencies
+        run: |
+          set -euo pipefail
+          uv python install 3.12
+          uv sync --python 3.12 --all-extras --frozen
+
+      - name: Run the test suite
+        run: |
+          set -euo pipefail
+          uv run pytest -q
+
+      - name: Install PyInstaller
+        run: |
+          set -euo pipefail
+          uv pip install pyinstaller
+
+      - name: Write the entry wrapper
+        run: |
+          set -euo pipefail
+          cat > ecosys_pi_entry.py <<'PY'
+          from ecosys_pi.cli import main
+
+          raise SystemExit(main())
+          PY
+          cat ecosys_pi_entry.py
+
+      - name: Build the one-file aarch64 binary
+        run: |
+          set -euo pipefail
+          # `--no-sync` keeps the just-installed PyInstaller in the venv.
+          uv run --no-sync pyinstaller \
+            --clean \
+            --noconfirm \
+            --onefile \
+            --name ecosys-pi \
+            --paths src \
+            --collect-all ecosys_pi \
+            --collect-all grpc \
+            --collect-all google.protobuf \
+            --collect-all sounddevice \
+            --collect-all numpy \
+            ecosys_pi_entry.py
+
+      - name: Verify the binary is aarch64 and runs
+        run: |
+          set -euo pipefail
+          file dist/ecosys-pi
+          file dist/ecosys-pi | grep -Eq 'ARM aarch64|aarch64'
+          dist/ecosys-pi --help
+          test "$?" -eq 0
+
+      - name: Build the release tarball
+        run: |
+          set -euo pipefail
+          stage="dist/release/ecosys-pi-linux-arm64"
+          mkdir -p "${stage}"
+          cp dist/ecosys-pi "${stage}/ecosys-pi"
+          chmod 0755 "${stage}/ecosys-pi"
+
+          cat > "${stage}/ecosys-client.service" <<'UNIT_EOF'
+          # ecosys-pi client — installed by install.sh to
+          # /etc/systemd/system/ecosys-client.service.
+          #
+          # The binary is self-contained; the hub address and camera settings
+          # come from /etc/ecosys/ecosys-client.env (systemd does not expand
+          # ${VAR} in ExecStart, the CLI reads the environment itself).
+          [Unit]
+          Description=ecosys.v1 Raspberry Pi client (video peer)
+          After=network-online.target wpa_supplicant@wlan0.service
+          Wants=network-online.target
+          StartLimitIntervalSec=0
+
+          [Service]
+          Type=simple
+          User=root
+          Environment=PYTHONUNBUFFERED=1
+          EnvironmentFile=-/etc/ecosys/ecosys-client.env
+          ExecStart=/usr/local/bin/ecosys-pi --mode video --frames 0
+          Restart=on-failure
+          RestartSec=5
+          TimeoutStopSec=10
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT_EOF
+
+          cat > "${stage}/ecosys-client.env.example" <<'ENV_EOF'
+          # ecosys-pi client environment — installed to
+          # /etc/ecosys/ecosys-client.env by install.sh (only if absent).
+          #
+          # systemd reads this file itself (EnvironmentFile=), so use plain
+          # KEY=value lines: no `export`, no shell expansion.
+          #
+          # The phone is the access point and the Pi joins its hotspot, so the
+          # hub is normally the Pi's default gateway (check with `ip route`).
+          PI_ECOSYS_HUB=10.240.85.29:9000
+
+          # Camera: the USB Y360 is a UVC device on /dev/video0. `uvc` hard-fails
+          # when the device (or ffmpeg) is missing.
+          PI_ECOSYS_VIDEO_SOURCE=uvc
+          PI_ECOSYS_VIDEO_DEVICE=/dev/video0
+
+          # Label sent in the unauthenticated stream_open frame.
+          PI_ECOSYS_DEVICE_NAME=ecosys-pi
+          ENV_EOF
+
+          cat > "${stage}/README.md" <<'README_EOF'
+          # ecosys-pi — linux/arm64 standalone build
+
+          Self-contained Raspberry Pi peer for the `ecosys.v1` hub. This build is
+          **linux/arm64 (aarch64) only** and targets Raspberry Pi 4 and 5 running
+          a 64-bit OS.
+
+          ## Contents
+
+          | File | Purpose |
+          | ---- | ------- |
+          | `ecosys-pi` | PyInstaller one-file aarch64 ELF binary |
+          | `ecosys-client.service` | systemd unit (binary at `/usr/local/bin/ecosys-pi`) |
+          | `ecosys-client.env.example` | hub and camera settings template |
+          | `install.sh` | root-only, idempotent installer |
+          | `README.md` | this file |
+
+          ## Prerequisites
+
+          The binary bundles the Python runtime but **not** the system media tools:
+
+          - `ffmpeg` — reads the UVC camera (`/dev/video0`)
+          - `alsa-utils` — provides `aplay` for hub-synthesized speech
+          - `libportaudio2` — optional, for the `sounddevice` playback fallback
+          - a UVC camera (for example the Logitech Y360) at `/dev/video0`
+
+          ```sh
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg alsa-utils
+          # optional playback fallback
+          sudo apt-get install -y libportaudio2
+          ```
+
+          ## Install
+
+          ```sh
+          tar xzf ecosys-pi-linux-arm64.tar.gz
+          cd ecosys-pi-linux-arm64
+          sudo ./install.sh
+          ```
+
+          `install.sh` copies the binary to `/usr/local/bin/ecosys-pi`, creates
+          `/etc/ecosys/ecosys-client.env` **only if it does not already exist**,
+          installs the unit to `/etc/systemd/system/ecosys-client.service`,
+          reloads systemd, and enables + starts the service.
+
+          ## Hub address
+
+          The default hub is the phone hotspot gateway:
+
+          ```
+          PI_ECOSYS_HUB=10.240.85.29:9000
+          ```
+
+          Edit `/etc/ecosys/ecosys-client.env` to change it, then:
+
+          ```sh
+          sudo systemctl restart ecosys-client
+          sudo systemctl status ecosys-client
+          journalctl -u ecosys-client -f
+          ```
+
+          ## Enable at boot
+
+          ```sh
+          sudo systemctl enable --now ecosys-client.service
+          ```
+
+          ## Uninstall
+
+          ```sh
+          sudo systemctl disable --now ecosys-client
+          sudo rm -f /usr/local/bin/ecosys-pi \
+            /etc/systemd/system/ecosys-client.service
+          sudo systemctl daemon-reload
+          # keep /etc/ecosys/ecosys-client.env if you want to preserve settings
+          ```
+          README_EOF
+
+          cat > "${stage}/install.sh" <<'INSTALL_EOF'
+          #!/usr/bin/env bash
+          # Install ecosys-pi (standalone aarch64 binary) as a boot-time service.
+          #
+          # Usage: sudo ./install.sh
+          #
+          # Idempotent: the binary and unit are refreshed on every run, while
+          # /etc/ecosys/ecosys-client.env is created once and never overwritten.
+          set -euo pipefail
+
+          SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+          readonly SCRIPT_DIR
+          readonly BIN_SRC="${SCRIPT_DIR}/ecosys-pi"
+          readonly UNIT_SRC="${SCRIPT_DIR}/ecosys-client.service"
+          readonly ENV_SRC="${SCRIPT_DIR}/ecosys-client.env.example"
+          readonly BIN_DEST="/usr/local/bin/ecosys-pi"
+          readonly ENV_DIR="/etc/ecosys"
+          readonly ENV_DEST="${ENV_DIR}/ecosys-client.env"
+          readonly UNIT_DEST="/etc/systemd/system/ecosys-client.service"
+
+          die() {
+            echo "install: FAIL: $*" >&2
+            exit 1
+          }
+
+          if [ "$(id -u)" -ne 0 ]; then
+            die "must run as root: sudo ./install.sh"
+          fi
+
+          for tool in install systemctl; do
+            command -v "${tool}" >/dev/null 2>&1 || die "missing required tool: ${tool}"
+          done
+
+          for file in "${BIN_SRC}" "${UNIT_SRC}" "${ENV_SRC}"; do
+            [ -f "${file}" ] || die "missing release file: ${file}"
+          done
+
+          install -m 0755 "${BIN_SRC}" "${BIN_DEST}"
+          echo "install: installed ${BIN_DEST}"
+
+          install -d -m 0755 "${ENV_DIR}"
+          if [ -e "${ENV_DEST}" ]; then
+            echo "install: keeping existing ${ENV_DEST}"
+          else
+            install -m 0600 "${ENV_SRC}" "${ENV_DEST}"
+            echo "install: installed ${ENV_DEST}"
+          fi
+
+          install -m 0644 "${UNIT_SRC}" "${UNIT_DEST}"
+          echo "install: installed ${UNIT_DEST}"
+
+          systemctl daemon-reload
+          systemctl enable --now ecosys-client.service
+          systemctl restart ecosys-client.service
+
+          echo "install: enabled and started ecosys-client.service"
+          echo "  status: journalctl -u ecosys-client -f"
+          echo "  config: ${ENV_DEST}"
+          INSTALL_EOF
+
+          chmod 0755 "${stage}/install.sh"
+          chmod 0644 \
+            "${stage}/README.md" \
+            "${stage}/ecosys-client.service" \
+            "${stage}/ecosys-client.env.example"
+
+          tar -C dist/release -czf ecosys-pi-linux-arm64.tar.gz ecosys-pi-linux-arm64
+          sha256sum dist/ecosys-pi ecosys-pi-linux-arm64.tar.gz \
+            | sed 's#dist/##' > ecosys-pi.sha256
+
+          echo "--- tarball contents ---"
+          tar -tzvf ecosys-pi-linux-arm64.tar.gz
+          echo "--- checksums ---"
+          cat ecosys-pi.sha256
+
+      - name: Publish the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ecosys-pi ${{ github.ref_name }} (linux/arm64)
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            Built from tag `${{ github.ref_name }}` (commit `${{ github.sha }}`) on a
+            native GitHub Actions linux/arm64 runner.
+
+            **Platform: linux/arm64 (aarch64) only.** This binary will not run on
+            x86_64.
+
+            ## Assets
+
+            | Asset | Description |
+            | ----- | ----------- |
+            | `ecosys-pi` | Self-contained PyInstaller one-file aarch64 ELF binary |
+            | `ecosys-pi-linux-arm64.tar.gz` | Binary + systemd unit + env example + `install.sh` + README |
+            | `ecosys-pi.sha256` | SHA-256 checksums |
+
+            ## Verified in CI
+
+            - `uname -m` was `aarch64`
+            - `file dist/ecosys-pi` reports an ARM aarch64 ELF
+            - `dist/ecosys-pi --help` exited `0`
+            - `uv run pytest -q` passed on this commit before the artifact was built
+
+            ## Prerequisites (Raspberry Pi 4/5, 64-bit OS)
+
+            - `ffmpeg` for the UVC camera
+            - `alsa-utils` for `aplay` playback
+            - optional `libportaudio2` for the `sounddevice` fallback
+            - UVC camera at `/dev/video0`
+
+            ```sh
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg alsa-utils
+            ```
+
+            ## Install
+
+            ```sh
+            tar xzf ecosys-pi-linux-arm64.tar.gz
+            cd ecosys-pi-linux-arm64
+            sudo ./install.sh
+            sudo systemctl enable --now ecosys-client
+            ```
+
+            The default hub is `10.240.85.29:9000`; edit
+            `/etc/ecosys/ecosys-client.env` to change it.
+
+            ## Companion releases
+
+            - Phone hub: https://github.com/Glass-Storm/phone-manager/releases/tag/v1.0.0
+            - Smart glasses: https://github.com/Glass-Storm/SpeakerDiarazation-Gesture/releases/tag/v1.0.2
+          files: |
+            dist/ecosys-pi
+            ecosys-pi.sha256
+            ecosys-pi-linux-arm64.tar.gz
