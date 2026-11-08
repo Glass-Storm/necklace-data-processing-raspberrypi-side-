@@ -65,6 +65,10 @@ jobs:
         run: |
           set -euo pipefail
           uv python install 3.12
+          # The repo's smoke test requires the venv to expose system site
+          # packages (Debian's python3-picamera2 lives there on a real Pi), so
+          # create it the same way the deployment docs do before syncing.
+          uv venv --python 3.12 --system-site-packages
           uv sync --python 3.12 --all-extras --frozen
 
       - name: Run the test suite
