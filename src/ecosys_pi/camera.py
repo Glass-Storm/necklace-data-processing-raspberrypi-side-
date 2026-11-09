@@ -1,7 +1,7 @@
 """JPEG still capture for the ``ecosys.v1`` ``StreamFrame.image`` wire type.
 
 This module is the Pi's video source. It produces **320x240 JPEG** stills at
-**10 fps** for the additive ``ImageFrame`` member of the frozen contract: the hub
+**30 fps** for the additive ``ImageFrame`` member of the frozen contract: the hub
 decodes each still to run isolated gesture recognition on the person the necklace
 points at. There is **no H.264 path on the Pi** any more -- one JPEG per gesture
 sample matches the per-image recogniser and keeps the constrained device light.
@@ -71,8 +71,8 @@ __all__ = [
 DEFAULT_WIDTH = 320
 DEFAULT_HEIGHT = 240
 
-#: Still cadence reported to the camera and paced by the CLI pump: 10 frames/s.
-DEFAULT_FRAMERATE = 10.0
+#: Still cadence reported to the camera and paced by the CLI pump: 30 frames/s.
+DEFAULT_FRAMERATE = 30.0
 
 #: Seconds between stills at :data:`DEFAULT_FRAMERATE` (the CLI pump cadence).
 FRAME_INTERVAL_S = 1.0 / DEFAULT_FRAMERATE
@@ -410,7 +410,7 @@ def _select_still_encoder() -> Callable[[Any], bytes]:
 
 
 class JpegVideoSource:
-    """Real 320x240 @ 10 fps JPEG capture on a Raspberry Pi CSI camera.
+    """Real 320x240 @ 30 fps JPEG capture on a Raspberry Pi CSI camera.
 
     ``picamera2`` is imported lazily inside :meth:`open`, so importing this module
     on a host without the optional extra never fails. When the import or the
@@ -584,8 +584,18 @@ class UvcVideoSource:
             "-hide_banner",
             "-loglevel",
             "error",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
             "-f",
             "v4l2",
+            "-framerate",
+            str(int(DEFAULT_FRAMERATE)),
             "-video_size",
             f"{self.width}x{self.height}",
             "-i",
@@ -596,6 +606,8 @@ class UvcVideoSource:
             "mjpeg",
             "-q:v",
             str(self._quality),
+            "-flush_packets",
+            "1",
             "-",
         ]
 

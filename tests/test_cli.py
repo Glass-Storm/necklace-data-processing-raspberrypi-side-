@@ -274,9 +274,14 @@ def _run_video_pump(source: object, max_frames: int | None) -> tuple[int, list[o
     return sent, client.frames
 
 
-def test_video_frame_interval_is_the_10fps_cadence() -> None:
-    """The pump paces at exactly 10 frames per second (0.1 s)."""
-    assert cli._VIDEO_FRAME_INTERVAL_S == 0.1
+def test_video_frame_interval_is_the_30fps_cadence() -> None:
+    """The pump paces at exactly 30 frames per second."""
+    assert cli._VIDEO_FRAME_INTERVAL_S == pytest.approx(1.0 / 30.0)
+
+
+def test_stream_queue_is_the_low_latency_bound() -> None:
+    """The outbound queue is two frames, not the old 64-frame backlog."""
+    assert cli._STREAM_QUEUE_MAXSIZE == 2
 
 
 def test_video_pump_sends_image_frames_for_the_cap() -> None:

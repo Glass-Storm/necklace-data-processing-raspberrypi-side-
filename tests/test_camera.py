@@ -1,6 +1,6 @@
 """Tests for the JPEG still source that feeds the ``StreamFrame.image`` wire type.
 
-The camera produces **320x240 JPEG** stills at **10 fps** for the additive
+The camera produces **320x240 JPEG** stills at **30 fps** for the additive
 ``ecosys.v1`` ``ImageFrame`` member. The real ``JpegVideoSource`` cannot start on
 this host (no camera, no ``picamera2``); that is expected and is NOT a failure.
 Its lazy-import and unavailable-return posture IS tested here, together with the
@@ -20,14 +20,14 @@ import pytest
 
 from ecosys_pi import camera
 
-# --- Constants: 320x240 @ 10 fps and a bounded frame budget ------------------
+# --- Constants: 320x240 @ 30 fps and a bounded frame budget ------------------
 
 
-def test_defaults_are_320x240_at_10fps() -> None:
+def test_defaults_are_320x240_at_30fps() -> None:
     assert camera.DEFAULT_WIDTH == 320
     assert camera.DEFAULT_HEIGHT == 240
-    assert camera.DEFAULT_FRAMERATE == 10.0
-    assert camera.FRAME_INTERVAL_S == pytest.approx(0.1)
+    assert camera.DEFAULT_FRAMERATE == 30.0
+    assert camera.FRAME_INTERVAL_S == pytest.approx(1.0 / 30.0)
 
 
 def test_frame_budget_has_a_margin_under_the_hub_limit() -> None:
@@ -418,6 +418,10 @@ def test_uvc_source_reads_frames_from_the_ffmpeg_stream(
     assert command[command.index("-f") + 1] == "v4l2"
     assert command[command.index("-i") + 1] == str(device)
     assert "image2pipe" in command
+    assert command[command.index("-fflags") + 1] == "nobuffer"
+    assert command[command.index("-flags") + 1] == "low_delay"
+    assert command[command.index("-framerate") + 1] == "30"
+    assert command[command.index("-flush_packets") + 1] == "1"
     assert "mjpeg" in command
 
     frames = [source.read_frame() for _ in range(3)]

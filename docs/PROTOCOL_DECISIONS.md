@@ -32,7 +32,7 @@ wrong.
 ## (c) The Pi sends JPEG stills, NOT H.264
 
 The video producer sends `StreamFrame.image` (`ImageFrame{jpeg, pts_ms, width,
-height}`) at **320×240 and ~10 fps** (a 0.1 s pump cadence). It does **not** send
+height}`) at **320×240 and ~30 fps** (a 1/30 s pump cadence). It does **not** send
 `video_h264_nal`. This is the ONE media kind the hub decodes — into a bitmap,
 solely to run isolated gesture recognition. The hub never re-encodes, stores, or
 renders it.

@@ -29,7 +29,7 @@ the Pi is a **DHCP client** that joins the hotspot.
    and no mDNS; `--hub` / `PI_ECOSYS_HUB` override the gateway.
 2. **Stream** — one UNAUTHENTICATED `OpenStream`: the Pi opens it with a
    `stream_open` frame that binds its device id/role, then pushes `image`
-   (320×240 JPEG stills at ~10 fps) frames — and `audio_pcm16_16k` (640-byte,
+   (320×240 JPEG stills at ~30 fps) frames — and `audio_pcm16_16k` (640-byte,
    20 ms frames) only when microphone upload is explicitly opted in. The hub
    sends back `gesture` text and `tts_audio` (PCM16 @ 16 kHz), which the Pi
    plays; a `result` (transcription) frame is printed as the frozen

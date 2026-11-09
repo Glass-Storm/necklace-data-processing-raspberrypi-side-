@@ -64,8 +64,11 @@ STDOUT_CONTRACT = (
     "error: <detail>",
 )
 
-#: Pace for the video pump: one JPEG still per capture frame (10 fps).
-_VIDEO_FRAME_INTERVAL_S = 0.1
+#: Pace for the video pump: one JPEG still per capture frame (30 fps).
+_VIDEO_FRAME_INTERVAL_S = 1.0 / 30.0
+
+#: Low-latency outbound queue: two frames, not the default 64-frame backlog.
+_STREAM_QUEUE_MAXSIZE = 2
 
 #: How long to retry gateway discovery after a hotspot join (DHCP/association lag).
 GATEWAY_RETRY_TIMEOUT_S = 30.0
@@ -332,6 +335,7 @@ async def _run_session(
             on_gesture=on_gesture,
             device_id=device_id,
             role=ecosys_pb2.DEVICE_ROLE_DAEMON,
+            queue_maxsize=_STREAM_QUEUE_MAXSIZE,
         )
 
         stream_task = asyncio.create_task(client.run(), name="ecosys-cli-stream")
@@ -408,7 +412,7 @@ async def _run_video(
     still ready yet and when a bounded source is exhausted, so this loop consults
     ``source.done`` to tell those apart: a live camera is never done and the pump
     simply keeps polling, while a bounded source stops. A real camera paces
-    itself; this loop also paces the (synthetic) source at the nominal 10 fps so
+    itself; this loop also paces the (synthetic) source at the nominal 30 fps so
     it never floods the wire.
     """
     from ecosys.v1 import ecosys_pb2
