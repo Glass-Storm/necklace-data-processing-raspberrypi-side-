@@ -265,6 +265,33 @@ class _GapThenFramesVideoSource:
         pass
 
 
+class _LatestFrameVideoSource:
+    """A source that records which read path the pump chose."""
+
+    width = 320
+    height = 240
+
+    def __init__(self) -> None:
+        self.latest_reads = 0
+
+    @property
+    def done(self) -> bool:
+        return self.latest_reads > 0
+
+    def open(self) -> bool:
+        return True
+
+    def read_frame(self) -> bytes | None:
+        return b"stale"
+
+    def read_latest_frame(self) -> bytes | None:
+        self.latest_reads += 1
+        return b"fresh"
+
+    def close(self) -> None:
+        pass
+
+
 def _run_video_pump(source: object, max_frames: int | None) -> tuple[int, list[object]]:
     client = _RecordingVideoClient()
     err = io.StringIO()
@@ -274,9 +301,20 @@ def _run_video_pump(source: object, max_frames: int | None) -> tuple[int, list[o
     return sent, client.frames
 
 
-def test_video_frame_interval_is_the_10fps_cadence() -> None:
-    """The pump paces at exactly 10 frames per second (0.1 s)."""
-    assert cli._VIDEO_FRAME_INTERVAL_S == 0.1
+def test_video_frame_interval_is_the_15fps_cadence() -> None:
+    """The pump paces at exactly 15 frames per second (1/15 s)."""
+    assert cli._VIDEO_FRAME_INTERVAL_S == pytest.approx(1.0 / 15.0)
+
+
+def test_video_pump_prefers_the_newest_frame_when_the_source_offers_it() -> None:
+    """A UVC source's drain hook wins over its stale read_frame()."""
+    source = _LatestFrameVideoSource()
+
+    sent, frames = _run_video_pump(source, max_frames=1)
+
+    assert sent == 1
+    assert frames[0].image.jpeg == b"fresh"
+    assert source.latest_reads == 1
 
 
 def test_video_pump_sends_image_frames_for_the_cap() -> None:

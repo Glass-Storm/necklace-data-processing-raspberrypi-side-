@@ -1,6 +1,6 @@
 """Tests for the JPEG still source that feeds the ``StreamFrame.image`` wire type.
 
-The camera produces **320x240 JPEG** stills at **10 fps** for the additive
+The camera produces **320x240 JPEG** stills at **15 fps** for the additive
 ``ecosys.v1`` ``ImageFrame`` member. The real ``JpegVideoSource`` cannot start on
 this host (no camera, no ``picamera2``); that is expected and is NOT a failure.
 Its lazy-import and unavailable-return posture IS tested here, together with the
@@ -20,14 +20,14 @@ import pytest
 
 from ecosys_pi import camera
 
-# --- Constants: 320x240 @ 10 fps and a bounded frame budget ------------------
+# --- Constants: 320x240 @ 15 fps and a bounded frame budget ------------------
 
 
-def test_defaults_are_320x240_at_10fps() -> None:
+def test_defaults_are_320x240_at_15fps() -> None:
     assert camera.DEFAULT_WIDTH == 320
     assert camera.DEFAULT_HEIGHT == 240
-    assert camera.DEFAULT_FRAMERATE == 10.0
-    assert camera.FRAME_INTERVAL_S == pytest.approx(0.1)
+    assert camera.DEFAULT_FRAMERATE == 15.0
+    assert camera.FRAME_INTERVAL_S == pytest.approx(1.0 / 15.0)
 
 
 def test_frame_budget_has_a_margin_under_the_hub_limit() -> None:
@@ -429,6 +429,24 @@ def test_uvc_source_reads_frames_from_the_ffmpeg_stream(
     assert source.done is True
     source.close()
     assert process.terminated == 1
+
+
+def test_uvc_read_latest_frame_drops_the_backlog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The live pump must send the newest still, not replay the pipe backlog."""
+    device = tmp_path / "video0"
+    device.write_bytes(b"")
+    _process, _commands, popen = _install_fake_ffmpeg(monkeypatch, _MJPEG_FIXTURE)
+    source = camera.UvcVideoSource(device=str(device), popen=popen)
+
+    assert source.open() is True
+    assert source.read_frame() == _MJPEG_FRAME_ONE
+    assert source.pending_frames == 2, "the fake ffmpeg delivered all three at once"
+    monkeypatch.setattr(camera, "BACKLOG_DRAIN_THRESHOLD", 0)
+    assert source.read_latest_frame() == _MJPEG_FRAME_THREE
+    assert source.pending_frames == 0
+    source.close()
 
 
 def test_uvc_source_missing_device_is_a_named_error(tmp_path: Path) -> None:
