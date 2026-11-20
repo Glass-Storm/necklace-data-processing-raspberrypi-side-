@@ -306,6 +306,11 @@ def test_video_frame_interval_is_the_15fps_cadence() -> None:
     assert cli._VIDEO_FRAME_INTERVAL_S == pytest.approx(1.0 / 15.0)
 
 
+def test_stream_queue_is_the_low_latency_bound() -> None:
+    """The outbound queue is two frames, not the old 64-frame backlog."""
+    assert cli._STREAM_QUEUE_MAXSIZE == 2
+
+
 def test_video_pump_prefers_the_newest_frame_when_the_source_offers_it() -> None:
     """A UVC source's drain hook wins over its stale read_frame()."""
     source = _LatestFrameVideoSource()

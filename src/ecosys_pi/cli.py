@@ -67,6 +67,9 @@ STDOUT_CONTRACT = (
 #: Pace for the video pump: one JPEG still per capture frame (15 fps).
 _VIDEO_FRAME_INTERVAL_S = 1.0 / 15.0
 
+#: Low-latency outbound queue: two frames, not the default 64-frame backlog.
+_STREAM_QUEUE_MAXSIZE = 2
+
 #: Seconds between ``[Pi Pace]`` telemetry lines during a live pump.
 PACING_REPORT_S = 5.0
 
@@ -335,6 +338,7 @@ async def _run_session(
             on_gesture=on_gesture,
             device_id=device_id,
             role=ecosys_pb2.DEVICE_ROLE_DAEMON,
+            queue_maxsize=_STREAM_QUEUE_MAXSIZE,
         )
 
         stream_task = asyncio.create_task(client.run(), name="ecosys-cli-stream")
@@ -404,7 +408,7 @@ async def _run_video(
     err: IO[str],
     interval: float = _VIDEO_FRAME_INTERVAL_S,
 ) -> int:
-    """Pump 320x240 JPEG stills from ``source`` into the stream until capped.
+    """Pump JPEG stills from ``source`` into the stream until capped.
 
     ``max_frames is None`` runs until the source is exhausted or the process is
     interrupted. ``read_frame()`` returns ``None`` both when a live camera has no

@@ -1,9 +1,9 @@
 """JPEG still capture for the ``ecosys.v1`` ``StreamFrame.image`` wire type.
 
-This module is the Pi's video source. It produces **320x240 JPEG** stills at
-**15 fps** for the additive ``ImageFrame`` member of the frozen contract: the hub
-decodes each still to run isolated gesture recognition on the person the necklace
-points at. There is **no H.264 path on the Pi** any more -- one JPEG per gesture
+This module is the Pi's video source. It produces JPEG stills (320x240 on the CSI
+camera, 640x480 on the UVC webcam) at **15 fps** for the additive ``ImageFrame``
+member of the frozen contract: the hub decodes each still to run isolated gesture
+recognition on the person the necklace points at. There is **no H.264 path on the Pi** any more -- one JPEG per gesture
 sample matches the per-image recogniser and keeps the constrained device light.
 
 Two hardware backends are provided: the CSI path (:class:`JpegVideoSource` via
@@ -129,8 +129,7 @@ DEFAULT_UVC_QUALITY = 5
 
 #: Parsed frames that may sit in the UVC queue before read_latest_frame drains.
 #: Zero means always send the newest still: the preview's content age is the
-#: priority, and the gesture path has its own 8 fps cap, so dropping older
-#: queued frames is the right trade.
+#: priority, and dropping older queued frames is the right trade.
 BACKLOG_DRAIN_THRESHOLD = 0
 
 #: ffmpeg executable looked up on PATH for the UVC source.
@@ -606,6 +605,8 @@ class UvcVideoSource:
             # before the first still reaches the live preview.
             "-fflags",
             "nobuffer",
+            "-flags",
+            "low_delay",
             "-probesize",
             "32",
             "-analyzeduration",
@@ -636,6 +637,8 @@ class UvcVideoSource:
             "mjpeg",
             "-q:v",
             str(self._quality),
+            "-flush_packets",
+            "1",
             "-",
         ]
 
@@ -711,9 +714,8 @@ class UvcVideoSource:
         A live preview must show the room now. Sending a queued backlog in
         order would add the backlog's age to every later still; draining to
         the newest frame bounds the age at one capture interval and turns a
-        backlog into dropped frames instead of growing latency. The drain only
-        engages above :data:`BACKLOG_DRAIN_THRESHOLD`, because a normal ffmpeg
-        chunk carries two stills and draining it would halve the pump rate.
+        backlog into dropped frames instead of growing latency. With the
+        threshold at zero, every queued still is drained to the newest.
         """
         frame = self.read_frame()
         if frame is None:

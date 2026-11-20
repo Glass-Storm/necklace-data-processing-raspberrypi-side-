@@ -1,6 +1,6 @@
 """Tests for the JPEG still source that feeds the ``StreamFrame.image`` wire type.
 
-The camera produces **320x240 JPEG** stills at **15 fps** for the additive
+The camera produces JPEG stills (320x240 CSI, 640x480 UVC) at **15 fps** for the additive
 ``ecosys.v1`` ``ImageFrame`` member. The real ``JpegVideoSource`` cannot start on
 this host (no camera, no ``picamera2``); that is expected and is NOT a failure.
 Its lazy-import and unavailable-return posture IS tested here, together with the
@@ -419,6 +419,11 @@ def test_uvc_source_reads_frames_from_the_ffmpeg_stream(
     assert command[command.index("-i") + 1] == str(device)
     assert "image2pipe" in command
     assert "mjpeg" in command
+    assert command[command.index("-fflags") + 1] == "nobuffer"
+    assert command[command.index("-flags") + 1] == "low_delay"
+    assert command[command.index("-framerate") + 1] == "15"
+    assert command[command.index("-input_format") + 1] == "mjpeg"
+    assert command[command.index("-flush_packets") + 1] == "1"
 
     frames = [source.read_frame() for _ in range(3)]
     assert frames == [_MJPEG_FRAME_ONE, _MJPEG_FRAME_TWO, _MJPEG_FRAME_THREE]

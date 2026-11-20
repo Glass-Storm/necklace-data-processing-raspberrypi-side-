@@ -2,7 +2,7 @@
 
 The Raspberry Pi peer for the `ecosys.v1` device ecosystem. It joins the phone's
 hotspot by hand, opens an **UNAUTHENTICATED** gRPC stream to the `phone-manager`
-hub, streams **JPEG stills** (320×240), and plays the audio the hub synthesizes.
+hub, streams **JPEG stills** (320×240 CSI / 640×480 UVC), and plays the audio the hub synthesizes.
 Microphone (PCM16) upload is **opt-in** — the necklace is a constrained device
 and is video-only by default. It no longer pairs, heartbeats, or synthesizes
 speech locally.
@@ -29,7 +29,7 @@ the Pi is a **DHCP client** that joins the hotspot.
    and no mDNS; `--hub` / `PI_ECOSYS_HUB` override the gateway.
 2. **Stream** — one UNAUTHENTICATED `OpenStream`: the Pi opens it with a
    `stream_open` frame that binds its device id/role, then pushes `image`
-   (320×240 JPEG stills at ~15 fps) frames — and `audio_pcm16_16k` (640-byte,
+   (320×240 CSI / 640×480 UVC JPEG stills at ~15 fps) frames — and `audio_pcm16_16k` (640-byte,
    20 ms frames) only when microphone upload is explicitly opted in. The hub
    sends back `gesture` text and `tts_audio` (PCM16 @ 16 kHz), which the Pi
    plays; a `result` (transcription) frame is printed as the frozen
