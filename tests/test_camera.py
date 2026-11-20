@@ -1,6 +1,6 @@
 """Tests for the JPEG still source that feeds the ``StreamFrame.image`` wire type.
 
-The camera produces **320x240 JPEG** stills at **30 fps** for the additive
+The camera produces JPEG stills (320x240 CSI, 640x480 UVC) at **15 fps** for the additive
 ``ecosys.v1`` ``ImageFrame`` member. The real ``JpegVideoSource`` cannot start on
 this host (no camera, no ``picamera2``); that is expected and is NOT a failure.
 Its lazy-import and unavailable-return posture IS tested here, together with the
@@ -20,14 +20,14 @@ import pytest
 
 from ecosys_pi import camera
 
-# --- Constants: 320x240 @ 30 fps and a bounded frame budget ------------------
+# --- Constants: 320x240 @ 15 fps and a bounded frame budget ------------------
 
 
-def test_defaults_are_320x240_at_30fps() -> None:
+def test_defaults_are_320x240_at_15fps() -> None:
     assert camera.DEFAULT_WIDTH == 320
     assert camera.DEFAULT_HEIGHT == 240
-    assert camera.DEFAULT_FRAMERATE == 30.0
-    assert camera.FRAME_INTERVAL_S == pytest.approx(1.0 / 30.0)
+    assert camera.DEFAULT_FRAMERATE == 15.0
+    assert camera.FRAME_INTERVAL_S == pytest.approx(1.0 / 15.0)
 
 
 def test_frame_budget_has_a_margin_under_the_hub_limit() -> None:
@@ -418,11 +418,12 @@ def test_uvc_source_reads_frames_from_the_ffmpeg_stream(
     assert command[command.index("-f") + 1] == "v4l2"
     assert command[command.index("-i") + 1] == str(device)
     assert "image2pipe" in command
+    assert "mjpeg" in command
     assert command[command.index("-fflags") + 1] == "nobuffer"
     assert command[command.index("-flags") + 1] == "low_delay"
-    assert command[command.index("-framerate") + 1] == "30"
+    assert command[command.index("-framerate") + 1] == "15"
+    assert command[command.index("-input_format") + 1] == "mjpeg"
     assert command[command.index("-flush_packets") + 1] == "1"
-    assert "mjpeg" in command
 
     frames = [source.read_frame() for _ in range(3)]
     assert frames == [_MJPEG_FRAME_ONE, _MJPEG_FRAME_TWO, _MJPEG_FRAME_THREE]
@@ -433,6 +434,24 @@ def test_uvc_source_reads_frames_from_the_ffmpeg_stream(
     assert source.done is True
     source.close()
     assert process.terminated == 1
+
+
+def test_uvc_read_latest_frame_drops_the_backlog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The live pump must send the newest still, not replay the pipe backlog."""
+    device = tmp_path / "video0"
+    device.write_bytes(b"")
+    _process, _commands, popen = _install_fake_ffmpeg(monkeypatch, _MJPEG_FIXTURE)
+    source = camera.UvcVideoSource(device=str(device), popen=popen)
+
+    assert source.open() is True
+    assert source.read_frame() == _MJPEG_FRAME_ONE
+    assert source.pending_frames == 2, "the fake ffmpeg delivered all three at once"
+    monkeypatch.setattr(camera, "BACKLOG_DRAIN_THRESHOLD", 0)
+    assert source.read_latest_frame() == _MJPEG_FRAME_THREE
+    assert source.pending_frames == 0
+    source.close()
 
 
 def test_uvc_source_missing_device_is_a_named_error(tmp_path: Path) -> None:

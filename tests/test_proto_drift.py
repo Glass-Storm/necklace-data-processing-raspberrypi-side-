@@ -25,7 +25,14 @@ HUB_PROTO = (
 
 
 def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """Hash the contract with canonical LF endings.
+
+    Git may check the frozen proto out with CRLF on Windows even though the blob
+    and the recorded provenance hash use LF. Normalising CRLF keeps the check
+    byte-identical across hosts without weakening it for real content changes.
+    """
+    data = path.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(data).hexdigest()
 
 
 def test_vendored_proto_exists() -> None:

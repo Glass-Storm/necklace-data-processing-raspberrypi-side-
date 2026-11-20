@@ -64,11 +64,14 @@ STDOUT_CONTRACT = (
     "error: <detail>",
 )
 
-#: Pace for the video pump: one JPEG still per capture frame (30 fps).
-_VIDEO_FRAME_INTERVAL_S = 1.0 / 30.0
+#: Pace for the video pump: one JPEG still per capture frame (15 fps).
+_VIDEO_FRAME_INTERVAL_S = 1.0 / 15.0
 
 #: Low-latency outbound queue: two frames, not the default 64-frame backlog.
 _STREAM_QUEUE_MAXSIZE = 2
+
+#: Seconds between ``[Pi Pace]`` telemetry lines during a live pump.
+PACING_REPORT_S = 5.0
 
 #: How long to retry gateway discovery after a hotspot join (DHCP/association lag).
 GATEWAY_RETRY_TIMEOUT_S = 30.0
@@ -405,15 +408,17 @@ async def _run_video(
     err: IO[str],
     interval: float = _VIDEO_FRAME_INTERVAL_S,
 ) -> int:
-    """Pump 320x240 JPEG stills from ``source`` into the stream until capped.
+    """Pump JPEG stills from ``source`` into the stream until capped.
 
     ``max_frames is None`` runs until the source is exhausted or the process is
     interrupted. ``read_frame()`` returns ``None`` both when a live camera has no
     still ready yet and when a bounded source is exhausted, so this loop consults
     ``source.done`` to tell those apart: a live camera is never done and the pump
     simply keeps polling, while a bounded source stops. A real camera paces
-    itself; this loop also paces the (synthetic) source at the nominal 30 fps so
-    it never floods the wire.
+    itself; this loop also paces the (synthetic) source at the nominal 15 fps so
+    it never floods the wire. Each tick asks for the NEWEST still: a UVC source
+    exposes ``read_latest_frame`` to drain its backlog, so a slow phone turns a
+    camera-pipe backlog into dropped frames instead of ever-growing latency.
     """
     from ecosys.v1 import ecosys_pb2
 
@@ -427,15 +432,24 @@ async def _run_video(
 
     width = getattr(source, "width", DEFAULT_WIDTH)
     height = getattr(source, "height", DEFAULT_HEIGHT)
+    read_still = getattr(source, "read_latest_frame", source.read_frame)
     sent = 0
+    next_at = time.monotonic()
+    report_at = time.monotonic()
+    window_frames = 0
+    window_read_ms = 0.0
+    window_send_ms = 0.0
     try:
         while max_frames is None or sent < max_frames:
-            jpeg = source.read_frame()
+            read_started = time.monotonic()
+            jpeg = read_still()
+            read_ms = (time.monotonic() - read_started) * 1_000.0
             if jpeg is None:
                 if source.done:
                     break
                 await asyncio.sleep(interval)
                 continue
+            send_started = time.monotonic()
             await client.send(
                 ecosys_pb2.StreamFrame(
                     image=ecosys_pb2.ImageFrame(
@@ -446,8 +460,39 @@ async def _run_video(
                     )
                 )
             )
+            window_send_ms += (time.monotonic() - send_started) * 1_000.0
+            window_read_ms += read_ms
+            window_frames += 1
             sent += 1
-            await asyncio.sleep(interval)
+            now = time.monotonic()
+            if now - report_at >= PACING_REPORT_S:
+                elapsed = now - report_at
+                print(
+                    f"[Pi Pace] fps={window_frames / elapsed:.1f} "
+                    f"pending={getattr(source, 'pending_frames', -1)} "
+                    f"read_ms={window_read_ms / max(window_frames, 1):.1f} "
+                    f"send_ms={window_send_ms / max(window_frames, 1):.1f} "
+                    f"wall_ms={time.time_ns() // 1_000_000} "
+                    f"mono_ms={time.monotonic_ns() // 1_000_000}",
+                    file=err,
+                )
+                report_at = now
+                window_frames = 0
+                window_read_ms = 0.0
+                window_send_ms = 0.0
+            # Fixed-rate pacing: the next frame is due one interval after the previous
+            # DEADLINE, not one interval after the send finished. Sleeping `interval`
+            # after each send made the real period interval + send time, so the camera
+            # (15 fps) outran the pump and its pipe accumulated stale frames — the
+            # preview lag grew the longer the session ran.
+            next_at += interval
+            delay = next_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            else:
+                # A slow send already consumed the next slot; restart the cadence
+                # instead of firing a catch-up burst.
+                next_at = time.monotonic()
         return sent
     finally:
         source.close()

@@ -1,9 +1,9 @@
 """JPEG still capture for the ``ecosys.v1`` ``StreamFrame.image`` wire type.
 
-This module is the Pi's video source. It produces **320x240 JPEG** stills at
-**30 fps** for the additive ``ImageFrame`` member of the frozen contract: the hub
-decodes each still to run isolated gesture recognition on the person the necklace
-points at. There is **no H.264 path on the Pi** any more -- one JPEG per gesture
+This module is the Pi's video source. It produces JPEG stills (320x240 on the CSI
+camera, 640x480 on the UVC webcam) at **15 fps** for the additive ``ImageFrame``
+member of the frozen contract: the hub decodes each still to run isolated gesture
+recognition on the person the necklace points at. There is **no H.264 path on the Pi** any more -- one JPEG per gesture
 sample matches the per-image recogniser and keeps the constrained device light.
 
 Two hardware backends are provided: the CSI path (:class:`JpegVideoSource` via
@@ -34,6 +34,7 @@ import base64
 import importlib.util
 import io
 import os
+import select
 import shutil
 import subprocess
 import threading
@@ -42,6 +43,7 @@ from collections.abc import Callable, Mapping
 from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
+    "BACKLOG_DRAIN_THRESHOLD",
     "CameraSourceError",
     "DEFAULT_FRAMERATE",
     "DEFAULT_HEIGHT",
@@ -71,8 +73,8 @@ __all__ = [
 DEFAULT_WIDTH = 320
 DEFAULT_HEIGHT = 240
 
-#: Still cadence reported to the camera and paced by the CLI pump: 30 frames/s.
-DEFAULT_FRAMERATE = 30.0
+#: Still cadence reported to the camera and paced by the CLI pump: 15 frames/s.
+DEFAULT_FRAMERATE = 15.0
 
 #: Seconds between stills at :data:`DEFAULT_FRAMERATE` (the CLI pump cadence).
 FRAME_INTERVAL_S = 1.0 / DEFAULT_FRAMERATE
@@ -124,6 +126,11 @@ DEFAULT_UVC_HEIGHT = 480
 
 #: ffmpeg MJPEG quality (1 = best, 31 = worst) for the V4L2 -> image2pipe pump.
 DEFAULT_UVC_QUALITY = 5
+
+#: Parsed frames that may sit in the UVC queue before read_latest_frame drains.
+#: Zero means always send the newest still: the preview's content age is the
+#: priority, and dropping older queued frames is the right trade.
+BACKLOG_DRAIN_THRESHOLD = 0
 
 #: ffmpeg executable looked up on PATH for the UVC source.
 DEFAULT_FFMPEG = "ffmpeg"
@@ -410,7 +417,7 @@ def _select_still_encoder() -> Callable[[Any], bytes]:
 
 
 class JpegVideoSource:
-    """Real 320x240 @ 30 fps JPEG capture on a Raspberry Pi CSI camera.
+    """Real 320x240 @ 15 fps JPEG capture on a Raspberry Pi CSI camera.
 
     ``picamera2`` is imported lazily inside :meth:`open`, so importing this module
     on a host without the optional extra never fails. When the import or the
@@ -576,6 +583,16 @@ class UvcVideoSource:
             return self._exhausted
         return self._exhausted and not self._pending
 
+    @property
+    def pending_frames(self) -> int:
+        """Complete frames parsed from the pipe but not yet consumed.
+
+        Measurement only: a value that grows across a session means the camera
+        outruns the pump, which is the latency backlog this instrumentation exists
+        to expose.
+        """
+        return len(self._pending)
+
     def ffmpeg_command(self, executable: str | None = None) -> list[str]:
         """The exact persistent ffmpeg pipeline used for the webcam."""
         binary = executable if executable is not None else self._ffmpeg
@@ -584,6 +601,8 @@ class UvcVideoSource:
             "-hide_banner",
             "-loglevel",
             "error",
+            # Low-latency input: do not let ffmpeg build a multi-frame buffer
+            # before the first still reaches the live preview.
             "-fflags",
             "nobuffer",
             "-flags",
@@ -592,14 +611,26 @@ class UvcVideoSource:
             "32",
             "-analyzeduration",
             "0",
+            "-max_delay",
+            "0",
             "-f",
             "v4l2",
+            # Cap the CAPTURE rate at the pump cadence. Without this, ffmpeg writes the
+            # webcam's native 30 fps into a pipe the client drains at 15 fps, so the
+            # pipe and the V4L2 buffers hold a few stale frames and the hub's live
+            # preview visibly lags the room.
             "-framerate",
             str(int(DEFAULT_FRAMERATE)),
+            "-input_format",
+            "mjpeg",
             "-video_size",
             f"{self.width}x{self.height}",
             "-i",
             self.device,
+            # Drop/duplicate on the way out too, so the parser sees exactly one JPEG
+            # per pump tick.
+            "-r",
+            str(int(DEFAULT_FRAMERATE)),
             "-f",
             "image2pipe",
             "-vcodec",
@@ -675,6 +706,46 @@ class UvcVideoSource:
             if not chunk:
                 self._exhausted = True
                 raise CameraSourceError(self._eof_message())
+            self._pending.extend(self._parser.feed(chunk))
+
+    def read_latest_frame(self) -> bytes | None:
+        """Return the newest complete JPEG, discarding older queued stills.
+
+        A live preview must show the room now. Sending a queued backlog in
+        order would add the backlog's age to every later still; draining to
+        the newest frame bounds the age at one capture interval and turns a
+        backlog into dropped frames instead of growing latency. With the
+        threshold at zero, every queued still is drained to the newest.
+        """
+        frame = self.read_frame()
+        if frame is None:
+            return None
+        self._drain_ready_pipe()
+        while self.pending_frames > BACKLOG_DRAIN_THRESHOLD:
+            newer = self.read_frame()
+            if newer is None:
+                break
+            frame = newer
+        return frame
+
+    def _drain_ready_pipe(self) -> None:
+        """Pull all bytes currently waiting in the OS pipe into ``_pending``."""
+        process = self._process
+        if process is None:
+            return
+        stream = getattr(process, "stdout", None)
+        if stream is None:
+            return
+        while True:
+            try:
+                ready, _, _ = select.select([stream], [], [], 0.0)
+            except (OSError, ValueError, TypeError):
+                return
+            if not ready:
+                return
+            chunk = self._read_chunk()
+            if not chunk:
+                return
             self._pending.extend(self._parser.feed(chunk))
 
     def close(self) -> None:
